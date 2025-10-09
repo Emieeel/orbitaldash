@@ -1,6 +1,0 @@
-{
-    "files.associations": {
-        "**/.github/copilot-instructions.md": "markdown",
-        "copilot-instructions.md": "markdown"
-    }
-}
