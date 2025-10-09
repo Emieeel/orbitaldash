@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "orbitaldash"
+version = "0.1.0"
+description = "Light-weight Dash app to visualize molecular orbitals as isosurfaces from provided geometry, basis, and MO coefficients"
+authors = [{ name = "Your Name", email = "you@example.com" }]
+license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["numpy", "scipy", "dash", "plotly", "pyscf; extra == 'pyscf'"]
+
+[project.optional-dependencies]
+full = ["pyscf"]
+dev = ["pytest"]
+
+[project.urls]
+Homepage = "https://example.com/orbitaldash"
+Repository = "https://example.com/orbitaldash.git"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
