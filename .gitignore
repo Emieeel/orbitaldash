@@ -1,0 +1,53 @@
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments and local env files
+.env
+.venv
+venv/
+env/
+.conda/
+*.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Testing & coverage
+.pytest_cache/
+.coverage*
+coverage.xml
+htmlcov/
+
+# Build & distribution
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Editors/IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Project-specific
+OLD/
+.github/
+
+# PySCF / computational artifacts
+*.chk
+*.fchk
+*.molden
+*.cube
+pyscf_*.log
+pyscf_*.out
+*.tmp
+
+# Node (if any)
+node_modules/
