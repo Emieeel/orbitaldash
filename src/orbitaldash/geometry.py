@@ -1,3 +1,17 @@
+"""Geometry primitives and utilities.
+
+This module defines a minimal `Molecule` container and helpers for normalizing
+user-provided geometry inputs to a consistent internal representation.
+
+Conventions:
+- Coordinates are in Angstrom for all internal computations.
+- Element metadata is provided via `ELEMENT_COLORS` and `COVALENT_RADII`.
+
+Notes:
+    The supported symbol/Z maps are intentionally small to keep this package
+    lightweight. Extend the dictionaries if you need additional elements.
+"""
+
 import numpy as np
 from dataclasses import dataclass
 from typing import List, Sequence, Tuple, Union
@@ -29,11 +43,29 @@ _Z_TO_SYMBOL = {v: k for k, v in _SYMBOL_TO_Z.items()}
 
 @dataclass
 class Molecule:
+    """Simple molecule container.
+
+    Attributes:
+        symbols: List of element symbols (e.g., ["O", "H", "H"]).
+        coords: Cartesian coordinates in Angstrom with shape (N, 3).
+
+    Notes:
+        This class keeps only what is necessary for visualization and simple
+        bond inference. For electronic structure data, see orbitals module.
+    """
     symbols: List[str]
     coords: np.ndarray  # shape (N, 3), Angstrom
 
     @property
     def atomic_numbers(self) -> np.ndarray:
+        """Atomic numbers derived from element symbols.
+
+        Returns:
+            np.ndarray: Array of shape (N,) with integer atomic numbers.
+
+        Raises:
+            ValueError: If an unknown element symbol is encountered.
+        """
         Z = []
         for s in self.symbols:
             if s not in _SYMBOL_TO_Z:
@@ -42,6 +74,18 @@ class Molecule:
         return np.array(Z, dtype=int)
 
     def infer_bonds(self, scale: float = 1.2) -> List[Tuple[int, int]]:
+        """Infer covalent bonds using radii and a distance cutoff.
+
+        The cutoff for two atoms i and j is computed as:
+            cutoff = scale * (r_i + r_j)
+        where radii are looked up in `COVALENT_RADII` (fallback 0.7 Å).
+
+        Args:
+            scale: Multiplicative factor applied to the sum of covalent radii.
+
+        Returns:
+            List[Tuple[int, int]]: Pairs of atom indices (i, j) with i < j.
+        """
         Z = self.atomic_numbers
         bonds = []
         for i in range(len(Z)):
@@ -54,10 +98,34 @@ class Molecule:
         return bonds
 
     def to_dict(self):
+        """Serialize to a plain dictionary.
+
+        Returns:
+            dict: Dictionary with keys ``symbols`` and ``coords``.
+        """
         return {"symbols": self.symbols, "coords": self.coords}
 
 
 def standardize_geometry(geometry: Union[dict, Tuple[Sequence[int], np.ndarray], Tuple[Sequence[str], np.ndarray], Molecule]) -> Molecule:
+    """Normalize geometry inputs to a :class:`Molecule`.
+
+    Accepted forms:
+
+    - Molecule instance (returned as-is)
+    - dict with keys ``symbols`` (list[str]) and ``coords`` (array (N, 3))
+    - tuple of (Z, coords) where Z are atomic numbers (Sequence[int])
+    - tuple of (symbols, coords) where symbols are element strings
+
+    Args:
+        geometry: Geometry in one of the accepted formats.
+
+    Returns:
+        Molecule: Standardized molecule with Angstrom coordinates.
+
+    Raises:
+        ValueError: If the input dict is missing required keys or symbols are
+            unknown.
+    """
     if isinstance(geometry, Molecule):
         return geometry
     if isinstance(geometry, dict):

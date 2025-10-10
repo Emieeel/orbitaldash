@@ -1,3 +1,16 @@
+"""Grid creation and molecular orbital evaluation utilities.
+
+This module provides:
+
+- Uniform Cartesian grid generation around a molecule.
+- Optional PySCF-backed AO/MO evaluation on arbitrary grids.
+- A pluggable :class:`OrbitalEvaluator` with caching and adjustable spacing.
+
+Units:
+    All geometry and grid coordinates are in Angstrom internally. Conversion
+    to Bohr is handled when calling PySCF.
+"""
+
 import numpy as np
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, Any, Callable
@@ -11,6 +24,15 @@ ANG_TO_BOHR = 1.0 / BOHR_TO_ANG
 
 @dataclass
 class OrbitalData:
+    """Container for orbital data sampled on a grid.
+
+    Attributes:
+        grid: Flat array of grid points with shape (P, 3) in Angstrom.
+        values: Flattened orbital values with shape (P,) for a single MO.
+        origin: Minimum corner (x_min, y_min, z_min) of the grid box.
+        steps: Number of steps in each dimension (nx, ny, nz).
+        spacing: Grid spacing in Angstrom.
+    """
     grid: np.ndarray        # shape (npoints, 3)
     values: np.ndarray      # shape (npoints,) for one MO
     origin: np.ndarray      # min corner of grid box
@@ -19,6 +41,23 @@ class OrbitalData:
 
 
 def make_grid(mol: Molecule, padding: float = 3.0, spacing: float = 0.3) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int, int], float]:
+    """Create a 3D Cartesian grid around a molecule.
+
+    The grid spans the bounding box of the molecule extended by ``padding``
+    in all directions, with uniform spacing along each axis.
+
+    Args:
+        mol: Molecule containing symbols and coordinates (Angstrom).
+        padding: Extra space (Å) added around the molecular extents.
+        spacing: Distance (Å) between adjacent grid points.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray, Tuple[int, int, int], float]:
+            - grid: Array of shape (P, 3) with grid point coordinates.
+            - origin: Minimum corner of the grid box (3,).
+            - steps: Number of steps in each dimension (nx, ny, nz).
+            - spacing: The spacing used (Å).
+    """
     mins = mol.coords.min(axis=0) - padding
     maxs = mol.coords.max(axis=0) + padding
     lengths = maxs - mins
@@ -34,6 +73,22 @@ def make_grid(mol: Molecule, padding: float = 3.0, spacing: float = 0.3) -> Tupl
 
 
 def build_pyscf_mol(mol: Molecule, basis_or_mol: Any) -> Any:
+    """Construct or reuse a PySCF molecule object.
+
+    If ``basis_or_mol`` already has PySCF-like attributes (``eval_gto`` and
+    ``nao``), it is returned as-is. Otherwise, a new ``gto.M`` is built using
+    the provided molecule and basis specification.
+
+    Args:
+        mol: Molecule with symbols and Angstrom coordinates.
+        basis_or_mol: Either a basis string or a PySCF molecule-like object.
+
+    Returns:
+        Any: A PySCF molecule object compatible with ``eval_gto``.
+
+    Raises:
+        RuntimeError: If PySCF is not available in the environment.
+    """
     try:
         from pyscf import gto  # type: ignore
     except ImportError as e:  # pragma: no cover
@@ -50,6 +105,21 @@ def build_pyscf_mol(mol: Molecule, basis_or_mol: Any) -> Any:
 
 
 def evaluate_mos_on_grid(mol: Molecule, basis_or_mol: Any, mo_coeff: np.ndarray, grid: np.ndarray) -> np.ndarray:
+    """Evaluate all molecular orbitals on a grid using PySCF.
+
+    Args:
+        mol: Molecule used to build the PySCF object when needed.
+        basis_or_mol: Basis specification or a PySCF mol-like object.
+        mo_coeff: MO coefficient matrix with shape (n_ao, n_mo).
+        grid: Grid points (P, 3) in Angstrom.
+
+    Returns:
+        np.ndarray: MO values on the grid with shape (P, n_mo).
+
+    Raises:
+        ValueError: If AO and MO dimensions are incompatible between spherical
+            and cartesian representations.
+    """
     pyscf_mol = build_pyscf_mol(mol, basis_or_mol)
     # PySCF expects evaluation coordinates in Bohr. Our grid is in Angstrom.
     grid_bohr = grid * ANG_TO_BOHR
@@ -73,11 +143,25 @@ def evaluate_mos_on_grid(mol: Molecule, basis_or_mol: Any, mo_coeff: np.ndarray,
 
 
 def evaluate_mo_on_grid_single(mol: Molecule, basis_or_mol: Any, mo_vec: np.ndarray, grid: np.ndarray, chunk_points: int = 200_000) -> np.ndarray:
-    """Evaluate a single MO on the grid efficiently.
+    """Evaluate a single MO on the grid efficiently using PySCF.
 
-    This avoids forming all MO values (npoints, n_mo) and instead evaluates AO values
-    in chunks and contracts with the selected MO vector only. This reduces memory and
-    extra compute when n_mo is large.
+    This avoids forming all MO values (P, n_mo). Instead, it evaluates AO values
+    in chunks and contracts with the selected MO vector only. This reduces memory
+    and compute when ``n_mo`` is large.
+
+    Args:
+        mol: Molecule used to build the PySCF object when needed.
+        basis_or_mol: Basis specification or a PySCF mol-like object.
+        mo_vec: Single MO coefficient vector with shape (n_ao,).
+        grid: Grid points (P, 3) in Angstrom.
+        chunk_points: Maximum number of grid points per AO evaluation batch.
+
+    Returns:
+        np.ndarray: Flattened MO values on the grid with shape (P,).
+
+    Raises:
+        ValueError: If AO and MO dimensions are incompatible between spherical
+            and cartesian representations.
     """
     pyscf_mol = build_pyscf_mol(mol, basis_or_mol)
     mo_vec = np.asarray(mo_vec).reshape(-1)
@@ -117,11 +201,39 @@ def evaluate_mo_on_grid_single(mol: Molecule, basis_or_mol: Any, mo_vec: np.ndar
 
 
 def get_orbital_isovalue(values: np.ndarray, fraction: float = 0.85) -> float:
+    """Compute an isovalue as a fraction of the maximum absolute value.
+
+    Args:
+        values: Flattened MO values on the grid.
+        fraction: Fraction of ``max(|values|)`` used to define the isovalue.
+
+    Returns:
+        float: The isovalue.
+    """
     vmax = np.abs(values).max()
     return fraction * vmax
 
 
 class OrbitalEvaluator:
+    """Evaluate and cache molecular orbital values on a grid.
+
+    Two evaluation modes are supported:
+
+    1. PySCF-backed evaluation based on ``geometry`` and ``basis``.
+    2. A custom evaluator callable ``custom_eval(grid) -> (P, n_mo)``.
+
+    Grid spacing can be adjusted via :meth:`regrid`, which invalidates caches.
+
+    Args:
+        geometry: Geometry in any format accepted by ``standardize_geometry``.
+        basis: Basis string or PySCF mol-like object; ignored if ``custom_eval``
+            is provided.
+        mo_coeff: MO coefficient matrix with shape (n_ao, n_mo).
+        custom_eval: Optional callable mapping grid (P, 3) to MO values
+            (P, n_mo).
+        spacing: Initial grid spacing in Angstrom.
+    """
+
     def __init__(self, geometry, basis: Any, mo_coeff: np.ndarray, custom_eval: Optional[Callable[[np.ndarray], np.ndarray]] = None, spacing: float = 0.3):
         self.mol = standardize_geometry(geometry)
         self.basis = basis  # may be a basis string or a PySCF mol object
@@ -133,6 +245,15 @@ class OrbitalEvaluator:
         self._spacing = spacing
 
     def grid(self) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int, int], float]:
+        """Get or build the current grid.
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray, Tuple[int, int, int], float]:
+                - grid: Array of shape (P, 3) with grid point coordinates.
+                - origin: Minimum corner of the grid box (3,).
+                - steps: Number of steps in each dimension (nx, ny, nz).
+                - spacing: The spacing used (Å).
+        """
         if self._grid_cache is None:
             self._grid_cache = make_grid(self.mol, spacing=self._spacing)
         return self._grid_cache
@@ -141,6 +262,12 @@ class OrbitalEvaluator:
         """Change grid spacing (resolution) and clear caches.
 
         Smaller spacing -> finer grid -> more points -> higher compute cost.
+
+        Args:
+            spacing: New grid spacing in Angstrom (must be positive).
+
+        Raises:
+            ValueError: If ``spacing`` is not positive.
         """
         if spacing <= 0:
             raise ValueError("spacing must be positive")
@@ -151,6 +278,17 @@ class OrbitalEvaluator:
         self._cache.clear()
 
     def mo_values(self, idx: int) -> np.ndarray:
+        """Get MO values for the selected index on the current grid.
+
+        Uses cached values when available; otherwise evaluates using either the
+        custom evaluator or PySCF.
+
+        Args:
+            idx: Orbital index (0-based).
+
+        Returns:
+            np.ndarray: Flattened values on the grid with shape (P,).
+        """
         if idx in self._cache:
             return self._cache[idx]
         grid, _, _, _ = self.grid()
@@ -165,6 +303,16 @@ class OrbitalEvaluator:
         return mo_vals
 
     def orbital_data(self, idx: int, isovalue: Optional[float] = None) -> OrbitalData:
+        """Construct an :class:`OrbitalData` bundle for a given orbital.
+
+        Args:
+            idx: Orbital index (0-based).
+            isovalue: Optional isovalue; if not provided, a default fraction
+                of the maximum absolute value is used.
+
+        Returns:
+            OrbitalData: Grid, values, origin, steps, and spacing.
+        """
         grid, origin, steps, spacing = self.grid()
         vals = self.mo_values(idx)
         if isovalue is None:

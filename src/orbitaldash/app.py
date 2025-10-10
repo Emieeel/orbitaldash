@@ -1,3 +1,14 @@
+"""Dash app for interactive molecular orbital visualization.
+
+This module wires together geometry, orbital evaluation, and Plotly/Dash to
+provide a browser-based UI for exploring orbitals as isosurfaces alongside a
+ball-and-stick molecular view.
+
+Key functions:
+    - :func:`build_figure`: Compose molecule and orbital isosurfaces.
+    - :func:`launch_app`: Create and run the Dash server.
+"""
+
 import numpy as np
 from typing import Optional, Any, Callable
 
@@ -11,11 +22,22 @@ import plotly.graph_objects as go
 
 def _molecule_traces(mol, show_labels: bool, show_bonds: bool, debug: bool = False,
                      atom_scale: float = 1.0, bond_width: int = 6):
-    """Return atom and bond traces.
+    """Create Plotly 3D traces for atoms and bonds.
 
-    Option A: draw full, untrimmed bonds center-to-center so they are guaranteed
-    to appear. Bonds are added AFTER atoms so they render on top ensuring
-    visibility even with large marker sizes.
+    Bonds are shortened at each end using covalent radii so that sticks meet
+    the spheres naturally. Bonds are added before atoms so they render behind
+    spheres, improving visibility.
+
+    Args:
+        mol: A :class:`~orbitaldash.geometry.Molecule` instance.
+        show_labels: Whether to draw element symbols above atoms.
+        show_bonds: Whether to draw bonds inferred from distances.
+        debug: If True, draw bonds in lime and enforce a minimum width.
+        atom_scale: Multiplier for atom marker sizes.
+        bond_width: Base bond line width (pixels) before zoom scaling.
+
+    Returns:
+        list: Plotly traces for bonds (optional) and atoms.
     """
     coords = mol.coords
     symbols = mol.symbols
@@ -90,6 +112,15 @@ def _molecule_traces(mol, show_labels: bool, show_bonds: bool, debug: bool = Fal
 
 
 def _orbital_isosurface(data, isovalue: float):
+    """Create dual-lobe isosurfaces for a single orbital.
+
+    Args:
+        data: :class:`~orbitaldash.orbitals.OrbitalData` for one orbital.
+        isovalue: Absolute isovalue threshold used for both lobes.
+
+    Returns:
+        list: Two Plotly Isosurface traces (negative and positive lobes).
+    """
     # reshape values into 3D
     grid = data.grid
     vals = data.values
@@ -118,6 +149,22 @@ def _orbital_isosurface(data, isovalue: float):
 
 def build_figure(mol, orbital_data=None, isovalue=None, show_labels: bool = True, show_bonds: bool = True, debug: bool = False,
                  atom_scale: float = 1.0, bond_width: int = 6, camera: Optional[dict] = None):
+    """Compose the full 3D figure with molecule and optional isosurfaces.
+
+    Args:
+        mol: A :class:`~orbitaldash.geometry.Molecule`.
+        orbital_data: Optional :class:`~orbitaldash.orbitals.OrbitalData` to render.
+        isovalue: Optional explicit isovalue; if None, uses a default fraction.
+        show_labels: Whether to draw element symbols above atoms.
+        show_bonds: Whether to draw inferred bonds.
+        debug: If True, draw bonds in a debug style.
+        atom_scale: Multiplier for atom marker sizes (further scaled by zoom).
+        bond_width: Base bond line width (further scaled by zoom).
+        camera: Optional Plotly camera dict to apply.
+
+    Returns:
+        plotly.graph_objects.Figure: The composed 3D figure.
+    """
     traces = _molecule_traces(
         mol, show_labels, show_bonds=show_bonds, debug=debug,
         atom_scale=atom_scale, bond_width=bond_width)
@@ -160,6 +207,27 @@ def launch_app(geometry, basis: str, mo_coeff, mo_energies: Optional[np.ndarray]
                    np.ndarray], np.ndarray]] = None,
                host='127.0.0.1', port=8050, auto_run: bool = True, debug: bool = False,
                max_orbitals: Optional[int] = 70):
+    """Launch a Dash app to explore molecular orbitals interactively.
+
+    The app renders a molecule with atom/bond controls and an orbital isosurface
+    overlay. Orbital values are provided by :class:`~orbitaldash.orbitals.OrbitalEvaluator`.
+
+    Args:
+        geometry: Geometry accepted by ``standardize_geometry`` (dict, tuple, or Molecule).
+        basis: Basis specification (string) or a PySCF mol-like object. Ignored if ``custom_eval`` is provided.
+        mo_coeff: MO coefficient matrix with shape (n_ao, n_mo).
+        mo_energies: Optional MO energies (n_mo,).
+        mo_occ: Optional occupations (n_mo,) used to initialize to HOMO.
+        custom_eval: Optional callable mapping grid (P, 3) to MO values (P, n_mo).
+        host: Host interface for the Dash server.
+        port: Port for the Dash server.
+        auto_run: Whether to immediately start the server.
+        debug: Enable debug styling for bonds.
+        max_orbitals: Cap how many orbitals are exposed in the UI.
+
+    Returns:
+        dash.Dash: The configured Dash application instance.
+    """
     mol = standardize_geometry(geometry)
     mo_coeff = np.asarray(mo_coeff)
     n_mo = mo_coeff.shape[1]
