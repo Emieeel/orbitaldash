@@ -45,25 +45,25 @@ See `examples/benzene_unc_ccpvdz.py`.
 
 ### Custom Evaluator (No PySCF)
 
-You can generate MO values yourself and supply a callable:
+You can generate MO values yourself and supply a callable directly to `launch_app`:
 
 ```python
 from orbitaldash import launch_app
-from orbitaldash.orbitals import OrbitalEvaluator
 import numpy as np
 
 geometry = {"symbols": ["H","H"], "coords": np.array([[0,0,0],[0,0,0.74]])}
-mo_coeff = np.eye(2)  # placeholder
+mo_coeff = np.eye(2)  # determines n_mo only in custom mode
 
 def custom_eval(grid):
-  # Return shape (npoints, n_mo). Here two fake gaussians.
+  # Return shape (npoints, n_mo). Here two fake Gaussians.
   g1 = np.exp(- (np.linalg.norm(grid - geometry['coords'][0], axis=1)**2) / 0.5)
   g2 = np.exp(- (np.linalg.norm(grid - geometry['coords'][1], axis=1)**2) / 0.5)
   return np.stack([g1, g2], axis=1)
 
-evaluator = OrbitalEvaluator(geometry, basis='custom', mo_coeff=mo_coeff, custom_eval=custom_eval)
-# Use evaluator inside a customized flow or adapt launch_app to accept it (future feature)
+launch_app(geometry=geometry, basis='custom', mo_coeff=mo_coeff, custom_eval=custom_eval)
 ```
+
+See `examples/custom_eval_demo.py` for a complete runnable script. With a custom evaluator provided, PySCF is not required.
 
 ## Data Conventions
 

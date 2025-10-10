@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Optional, Any
+from typing import Optional, Any, Callable
 
 from .geometry import standardize_geometry, ELEMENT_COLORS, COVALENT_RADII
 from .orbitals import OrbitalEvaluator
@@ -156,6 +156,8 @@ def build_figure(mol, orbital_data=None, isovalue=None, show_labels: bool = True
 
 
 def launch_app(geometry, basis: str, mo_coeff, mo_energies: Optional[np.ndarray] = None, mo_occ: Optional[np.ndarray] = None,
+               custom_eval: Optional[Callable[[
+                   np.ndarray], np.ndarray]] = None,
                host='127.0.0.1', port=8050, auto_run: bool = True, debug: bool = False,
                max_orbitals: Optional[int] = 70):
     mol = standardize_geometry(geometry)
@@ -169,7 +171,8 @@ def launch_app(geometry, basis: str, mo_coeff, mo_energies: Optional[np.ndarray]
             n_mo_display = min(70, n_mo)
     else:
         n_mo_display = n_mo
-    evaluator = OrbitalEvaluator(mol, basis, mo_coeff)
+    # If custom_eval is provided, OrbitalEvaluator will use it and not require PySCF.
+    evaluator = OrbitalEvaluator(mol, basis, mo_coeff, custom_eval=custom_eval)
 
     # Determine initial orbital index (HOMO if occupations provided)
     initial_idx = 0
