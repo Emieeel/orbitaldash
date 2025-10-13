@@ -7,6 +7,12 @@ Conventions:
 - Coordinates are in Angstrom for all internal computations.
 - Element metadata is provided via `ELEMENT_COLORS` and `COVALENT_RADII`.
 
+Color/radius sources:
+- Colors are chosen to match the widely used Jmol/CPK palette where possible.
+- Covalent radii (Å) are approximations primarily based on Cordero et al.
+    (2011, Dalton Trans., 40, 1919–1925) and common visualization defaults.
+    They are meant for bond inference and visual sizing, not for high-precision.
+
 Notes:
     The supported symbol/Z maps are intentionally small to keep this package
     lightweight. Extend the dictionaries if you need additional elements.
@@ -16,27 +22,83 @@ import numpy as np
 from dataclasses import dataclass
 from typing import List, Sequence, Tuple, Union
 
-# Basic element data (subset)
+# Basic element data (subset extended with common elements)
+# Colors aim to follow Jmol/CPK defaults for familiarity.
 ELEMENT_COLORS = {
-    1: '#FFFFFF',  # H
-    6: '#909090',  # C
-    7: '#3050F8',  # N
-    8: '#FF0D0D',  # O
+    1: '#FFFFFF',   # H
+    2: '#D9FFFF',   # He
+    3: '#CC80FF',   # Li
+    4: '#C2FF00',   # Be
+    5: '#FFB5B5',   # B
+    6: '#909090',   # C
+    7: '#3050F8',   # N
+    8: '#FF0D0D',   # O
+    9: '#90E050',   # F
+    10: '#B3E3F5',  # Ne
+    11: '#AB5CF2',  # Na
+    12: '#8AFF00',  # Mg
+    13: '#BFA6A6',  # Al
+    14: '#F0C8A0',  # Si
+    15: '#FF8000',  # P
+    16: '#FFFF30',  # S
+    17: '#1FF01F',  # Cl
+    18: '#80D1E3',  # Ar
+    19: '#8F40D4',  # K
+    20: '#3DFF00',  # Ca
+    35: '#A62929',  # Br
+    53: '#940094',  # I
 }
 
-COVALENT_RADII = {  # rough covalent radii in Angstrom
-    1: 0.31,
-    6: 0.76,
-    7: 0.71,
-    8: 0.66,
+COVALENT_RADII = {  # rough covalent radii in Angstrom (Cordero et al.)
+    1: 0.31,  # H
+    # He (formal covalent radius is not meaningful; small placeholder)
+    2: 0.28,
+    3: 1.28,  # Li
+    4: 0.96,  # Be
+    5: 0.84,  # B
+    6: 0.76,  # C
+    7: 0.71,  # N
+    8: 0.66,  # O
+    9: 0.57,  # F
+    10: 0.58,  # Ne
+    11: 1.66,  # Na
+    12: 1.41,  # Mg
+    13: 1.21,  # Al
+    14: 1.11,  # Si
+    15: 1.07,  # P
+    16: 1.05,  # S
+    17: 1.02,  # Cl
+    18: 1.06,  # Ar
+    19: 2.03,  # K
+    20: 1.76,  # Ca
+    35: 1.20,  # Br
+    53: 1.39,  # I
 }
 
-# Basic symbol <-> atomic number mapping (extend as needed)
+# Basic symbol <-> atomic number mapping (extended as needed)
 _SYMBOL_TO_Z = {
     'H': 1,
+    'He': 2,
+    'Li': 3,
+    'Be': 4,
+    'B': 5,
     'C': 6,
     'N': 7,
     'O': 8,
+    'F': 9,
+    'Ne': 10,
+    'Na': 11,
+    'Mg': 12,
+    'Al': 13,
+    'Si': 14,
+    'P': 15,
+    'S': 16,
+    'Cl': 17,
+    'Ar': 18,
+    'K': 19,
+    'Ca': 20,
+    'Br': 35,
+    'I': 53,
 }
 _Z_TO_SYMBOL = {v: k for k, v in _SYMBOL_TO_Z.items()}
 

@@ -433,6 +433,16 @@ def launch_app(geometry, basis: str, mo_coeff, mo_energies: Optional[np.ndarray]
         }
         return fig, info, new_cam_state
 
+    # Always print a user-friendly URL
+    display_host = '127.0.0.1' if str(host) in (
+        '0.0.0.0', '::') else str(host)
+    url = f"http://{display_host}:{port}/"
+    if auto_run:
+        print(f"OrbitalDash running at: {url}", flush=True)
+    else:
+        print(
+            f"OrbitalDash app initialized. Start the server to open: {url}", flush=True)
+
     # Dash >= (deprecation release) replaced run_server with run()/r
     # Provide broad compatibility across versions.
     if auto_run:
