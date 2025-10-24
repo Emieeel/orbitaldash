@@ -248,8 +248,8 @@ def launch_app(geometry, basis: str, mo_coeff, mo_energies: Optional[np.ndarray]
         try:
             occ = np.asarray(mo_occ).reshape(-1)
             if occ.shape[0] == n_mo:
-                # HOMO = highest index with occupation > tiny threshold
-                occ_thr = 1e-6
+                # define "HOMO" = highest index with occupation > 1.
+                occ_thr = 1.
                 occupied = np.where(occ > occ_thr)[0]
                 if occupied.size > 0:
                     initial_idx = int(occupied.max())
