@@ -202,7 +202,8 @@ def build_figure(mol, orbital_data=None, isovalue=None, show_labels: bool = True
     return fig
 
 
-def launch_app(geometry, basis: str, mo_coeff, mo_energies: Optional[np.ndarray] = None, mo_occ: Optional[np.ndarray] = None,
+def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np.ndarray] = None, mo_energies: Optional[np.ndarray] = None, mo_occ: Optional[np.ndarray] = None,
+               active: Optional[list[int]] = None,
                custom_eval: Optional[Callable[[
                    np.ndarray], np.ndarray]] = None,
                host='127.0.0.1', port=8050, auto_run: bool = True, debug: bool = False,
@@ -213,11 +214,18 @@ def launch_app(geometry, basis: str, mo_coeff, mo_energies: Optional[np.ndarray]
     overlay. Orbital values are provided by :class:`~orbitaldash.orbitals.OrbitalEvaluator`.
 
     Args:
-        geometry: Geometry accepted by ``standardize_geometry`` (dict, tuple, or Molecule).
+        geometry: Geometry accepted by ``standardize_geometry`` (dict, tuple, or Molecule). Alternatively, this
+            can be a PySCF SCF object (e.g., ``pyscf.scf.hf.RHF``) or a CASCI object
+            (e.g., ``pyscf.mcscf.casci.CASCI``), in which case ``basis`` and ``mo_coeff``
+            are inferred automatically unless explicitly provided.
         basis: Basis specification (string) or a PySCF mol-like object. Ignored if ``custom_eval`` is provided.
-        mo_coeff: MO coefficient matrix with shape (n_ao, n_mo).
+            When ``geometry`` is a PySCF SCF/CASCI object, this is inferred from ``obj.mol``.
+        mo_coeff: MO coefficient matrix with shape (n_ao, n_mo). When ``geometry`` is a PySCF SCF/CASCI object,
+            this is inferred from ``obj.mo_coeff`` unless explicitly provided here.
         mo_energies: Optional MO energies (n_mo,).
         mo_occ: Optional occupations (n_mo,) used to initialize to HOMO.
+        active: Optional list of orbital indices to highlight as "active" in the UI. If a CASCI object
+            is passed, and this is None, it will default to the CAS active space indices [ncore .. ncore+ncas-1].
         custom_eval: Optional callable mapping grid (P, 3) to MO values (P, n_mo).
         host: Host interface for the Dash server.
         port: Port for the Dash server.
@@ -228,7 +236,53 @@ def launch_app(geometry, basis: str, mo_coeff, mo_energies: Optional[np.ndarray]
     Returns:
         dash.Dash: The configured Dash application instance.
     """
+    # Allow passing a PySCF SCF object directly as the first argument, e.g. launch_app(mf)
+    # We detect by duck-typing to avoid importing pyscf unless needed.
+    if geometry is not None and not isinstance(geometry, dict):
+        # Detect a PySCF-like object by presence of required attributes
+        if hasattr(geometry, 'mo_coeff') and hasattr(geometry, 'mol'):
+            obj = geometry  # type: ignore[assignment]
+            pyscf_mol = getattr(obj, 'mol')
+            # Extract geometry in Angstrom
+            try:
+                coords_ang = pyscf_mol.atom_coords(unit='Angstrom')
+            except Exception:
+                # Fallback: request Bohr and convert locally
+                BOHR_TO_ANG = 0.529177210903
+                coords_ang = pyscf_mol.atom_coords(unit='Bohr') * BOHR_TO_ANG
+            # Prefer pure symbols if available
+            try:
+                symbols = [pyscf_mol.atom_pure_symbol(
+                    i) for i in range(pyscf_mol.natm)]
+            except Exception:
+                symbols = [pyscf_mol.atom_symbol(i)
+                           for i in range(pyscf_mol.natm)]
+            geometry = {"symbols": symbols, "coords": coords_ang}
+            basis = pyscf_mol
+            # Only override mo_* when not explicitly provided
+            if mo_coeff is None:
+                mo_coeff = getattr(obj, 'mo_coeff')
+            if mo_energies is None and hasattr(obj, 'mo_energy'):
+                mo_energies = getattr(obj, 'mo_energy')
+            if mo_occ is None and hasattr(obj, 'mo_occ'):
+                mo_occ = getattr(obj, 'mo_occ')
+            # If this is a CASCI object (duck-type via ncore/ncas), build default active indices
+            if active is None and hasattr(obj, 'ncore') and hasattr(obj, 'ncas'):
+                try:
+                    ncore = int(getattr(obj, 'ncore'))
+                    ncas = int(getattr(obj, 'ncas'))
+                    active = list(range(ncore, ncore + ncas))
+                except Exception:
+                    active = None
+
+    # Standardize geometry path (works for both dict and Molecule inputs)
+    if geometry is None:
+        raise ValueError(
+            "geometry must be provided, or pass a PySCF SCF object as the first argument to launch_app(mf)")
     mol = standardize_geometry(geometry)
+    if mo_coeff is None:
+        raise ValueError(
+            "mo_coeff must be provided unless a PySCF SCF object is passed as the first argument")
     mo_coeff = np.asarray(mo_coeff)
     n_mo = mo_coeff.shape[1]
     # Limit how many orbitals are exposed in the UI by default to keep it usable
@@ -242,17 +296,35 @@ def launch_app(geometry, basis: str, mo_coeff, mo_energies: Optional[np.ndarray]
     # If custom_eval is provided, OrbitalEvaluator will use it and not require PySCF.
     evaluator = OrbitalEvaluator(mol, basis, mo_coeff, custom_eval=custom_eval)
 
-    # Determine initial orbital index (HOMO if occupations provided)
+    # Determine initial orbital index and compute HOMO/LUMO for marks
+    # HOMO definition (requested): orbital with HIGHEST energy among those with occupation > 1
+    # LUMO (heuristic): orbital with LOWEST energy among those with occupation <= 1
     initial_idx = 0
+    homo_idx: Optional[int] = None
+    lumo_idx: Optional[int] = None
     if mo_occ is not None:
         try:
             occ = np.asarray(mo_occ).reshape(-1)
             if occ.shape[0] == n_mo:
-                # define "HOMO" = highest index with occupation > 1.
-                occ_thr = 1.
-                occupied = np.where(occ > occ_thr)[0]
-                if occupied.size > 0:
-                    initial_idx = int(occupied.max())
+                if mo_energies is not None and np.asarray(mo_energies).shape[0] == n_mo:
+                    en = np.asarray(mo_energies).reshape(-1)
+                    occ_mask = occ > 1.0
+                    virt_mask = occ <= 1.0
+                    if np.any(occ_mask):
+                        occ_idx = np.where(occ_mask)[0]
+                        homo_idx = int(occ_idx[np.argmax(en[occ_idx])])
+                        initial_idx = homo_idx
+                    if np.any(virt_mask):
+                        virt_idx = np.where(virt_mask)[0]
+                        lumo_idx = int(virt_idx[np.argmin(en[virt_idx])])
+                else:
+                    # Fallback: index-based HOMO as highest occupied index
+                    occupied = np.where(occ > 1.0)[0]
+                    if occupied.size > 0:
+                        homo_idx = int(occupied.max())
+                        initial_idx = homo_idx
+                        if homo_idx + 1 < n_mo:
+                            lumo_idx = homo_idx + 1
         except Exception:
             initial_idx = 0
     # Clamp initial selection into displayed range
@@ -275,6 +347,9 @@ def launch_app(geometry, basis: str, mo_coeff, mo_energies: Optional[np.ndarray]
         default_quality_index = min(range(len(quality_values)), key=lambda i: abs(
             quality_values[i]-coarse_default))
 
+    # Normalize active indices to a set for quick membership checks
+    active_set = set(int(i) for i in (active or []) if 0 <= int(i) < n_mo)
+
     def _orbital_marks(n: int):
         # Reduce label clutter for large numbers of orbitals
         if n <= 20:
@@ -283,8 +358,30 @@ def launch_app(geometry, basis: str, mo_coeff, mo_energies: Optional[np.ndarray]
             step = 5
         else:
             step = 10
-        marks = {i: str(i) for i in range(0, n, step)}
-        marks.setdefault(n - 1, str(n - 1))
+        marks: dict[int, Any] = {}
+        # Base sparse numeric marks
+        for i in range(0, n, step):
+            marks[i] = {"label": str(i)}
+        if (n - 1) not in marks:
+            marks[n - 1] = {"label": str(n - 1)}
+        # HOMO/LUMO markers
+        if homo_idx is not None and 0 <= homo_idx < n:
+            marks[homo_idx] = {"label": "H", "style": {
+                "color": "#2e7d32", "fontWeight": "bold"}}
+        if lumo_idx is not None and 0 <= lumo_idx < n:
+            marks[lumo_idx] = {"label": "L", "style": {
+                "color": "#6a1b9a", "fontWeight": "bold"}}
+        # Active orbital dots (orange) – append dot if a label exists, otherwise just a dot
+        for a in sorted(active_set):
+            if 0 <= a < n:
+                if a in marks and isinstance(marks[a], dict):
+                    lbl = str(marks[a].get("label", ""))
+                    if lbl not in ("H", "L"):
+                        marks[a] = {"label": f"{lbl} •", "style": {
+                            "color": "#e65100", "fontWeight": "bold"}}
+                else:
+                    marks[a] = {"label": "•", "style": {
+                        "color": "#e65100", "fontWeight": "bold"}}
         return marks
 
     app.layout = html.Div([
@@ -425,6 +522,8 @@ def launch_app(geometry, basis: str, mo_coeff, mo_energies: Optional[np.ndarray]
             info += f" | energy = {mo_energies[idx]:.6f} a.u."
         if mo_occ is not None:
             info += f" | occ = {mo_occ[idx]:.2f}"
+        if idx in active_set:
+            info += " | active"
         # Update camera store with base/last eye norms
         new_cam_state = {
             'base_eye_norm': base_eye,
