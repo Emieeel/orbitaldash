@@ -4,6 +4,12 @@ This is a quick sanity-check example to verify:
 - Orbital rendering quality (try different Quality + Smooth sliders)
 - Bond multiplicity visualization (N≡N should show as a triple bond)
 
+Notes:
+    Bond multiplicity in OrbitalDash is inferred heuristically from geometry
+    (interatomic distances vs covalent radii). If you stretch N2 far beyond its
+    equilibrium distance, the displayed bond order will downgrade (3 → 2 → 1)
+    and can eventually disappear depending on the bond cutoff.
+
 Requires: pyscf
 
 Run:
@@ -45,6 +51,8 @@ def main():
 
     # Simplest usage: pass the SCF object directly.
     # OrbitalDash will infer geometry, basis (mol), and mo_coeff/mo_energy/mo_occ.
+    # You can tune bond cutoff tolerance via bond_scale (default 1.2).
+    # For example, to hide very stretched N-N bonds: launch_app(mf, bond_scale=1.1, port=8054)
     launch_app(mf, port=8054)
 
 

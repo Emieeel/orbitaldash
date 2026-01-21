@@ -39,7 +39,7 @@ def _running_in_notebook() -> bool:
 
 
 def _molecule_traces(mol, show_labels: bool, show_bonds: bool, debug: bool = False,
-                     atom_scale: float = 1.0, bond_width: int = 6):
+                     atom_scale: float = 1.0, bond_width: int = 6, bond_scale: float = 1.2):
     """Create Plotly 3D traces for atoms and bonds.
 
     Bonds are shortened at each end using covalent radii so that sticks meet
@@ -87,7 +87,8 @@ def _molecule_traces(mol, show_labels: bool, show_bonds: bool, debug: bool = Fal
         hovertext=symbols,
         hoverinfo='text'
     )
-    bonds = mol.infer_bonds(with_order=True) if show_bonds else []
+    bonds = mol.infer_bonds(scale=float(bond_scale),
+                            with_order=True) if show_bonds else []
     if bonds:
         bond_xyz_by_order: dict[int, tuple[list, list, list]] = {
             1: ([], [], []),
@@ -286,7 +287,7 @@ def _smooth_field_separable(V: np.ndarray, passes: int) -> np.ndarray:
 
 
 def build_figure(mol, orbital_data=None, isovalue=None, show_labels: bool = True, show_bonds: bool = True, debug: bool = False,
-                 atom_scale: float = 1.0, bond_width: int = 6, camera: Optional[dict] = None,
+                 atom_scale: float = 1.0, bond_width: int = 6, bond_scale: float = 1.2, camera: Optional[dict] = None,
                  scene_ranges: Optional[dict[str, list[float]]] = None,
                  height: int = 650):
     """Compose the full 3D figure with molecule and optional isosurfaces.
@@ -300,6 +301,7 @@ def build_figure(mol, orbital_data=None, isovalue=None, show_labels: bool = True
         debug: If True, draw bonds in a debug style.
         atom_scale: Multiplier for atom marker sizes (further scaled by zoom).
         bond_width: Base bond line width (further scaled by zoom).
+        bond_scale: Distance cutoff scale for bond inference. Larger values show more/longer bonds.
         camera: Optional Plotly camera dict to apply.
 
     Returns:
@@ -307,7 +309,7 @@ def build_figure(mol, orbital_data=None, isovalue=None, show_labels: bool = True
     """
     traces = _molecule_traces(
         mol, show_labels, show_bonds=show_bonds, debug=debug,
-        atom_scale=atom_scale, bond_width=bond_width)
+        atom_scale=atom_scale, bond_width=bond_width, bond_scale=bond_scale)
     if orbital_data is not None:
         iso = isovalue
         if iso is None:
@@ -360,7 +362,8 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
                verbose: bool = False,
                jupyter: Optional[bool] = None,
                jupyter_mode: str = 'inline',
-               minimal_ui: Optional[bool] = None):
+               minimal_ui: Optional[bool] = None,
+               bond_scale: float = 1.2):
     """Launch a Dash app to explore molecular orbitals interactively.
 
     The app renders a molecule with atom/bond controls and an orbital isosurface
@@ -390,6 +393,7 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
         jupyter_mode: Dash Jupyter mode, typically 'inline' or 'external'. Only used when jupyter is True.
         minimal_ui: If True, use a compact UI suitable for notebook output cells (fewer controls + smaller figure).
             If None (default), this is enabled automatically when jupyter is True.
+        bond_scale: Distance cutoff scale for bond inference. Larger values show more/longer bonds.
 
     Returns:
         dash.Dash: The configured Dash application instance.
@@ -606,7 +610,7 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
                 id='orbital-plot',
                 figure=build_figure(
                     mol, show_labels=True, show_bonds=True, debug=debug,
-                    camera=default_camera, scene_ranges=scene_ranges, height=fig_height),
+                    bond_scale=bond_scale, camera=default_camera, scene_ranges=scene_ranges, height=fig_height),
                 config={'responsive': True, 'displaylogo': False},
                 style={
                     'height': f'{fig_height}px',
@@ -657,7 +661,7 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
             html.Div([
                 html.Div([
                     dcc.Graph(id='orbital-plot', figure=build_figure(mol, show_labels=True,
-                              show_bonds=True, debug=debug, camera=default_camera, scene_ranges=scene_ranges, height=fig_height), style={'height': f'{fig_height}px'})
+                              show_bonds=True, debug=debug, bond_scale=bond_scale, camera=default_camera, scene_ranges=scene_ranges, height=fig_height), style={'height': f'{fig_height}px'})
                 ], style={'flex': '1'}),
                 html.Div([
                     html.Div([
@@ -775,10 +779,11 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
 
         fig = build_figure(
             mol, data_disp, iso_val, show_labels=show_labels, show_bonds=show_bonds, debug=debug,
-            atom_scale=atom_scale_eff, bond_width=bond_width_eff, camera=camera_to_apply,
+            atom_scale=atom_scale_eff, bond_width=bond_width_eff, bond_scale=bond_scale, camera=camera_to_apply,
             scene_ranges=scene_ranges, height=fig_height)
 
-        bond_count = len(mol.infer_bonds()) if show_bonds else 0
+        bond_count = len(mol.infer_bonds(
+            scale=float(bond_scale))) if show_bonds else 0
         info = f"Orbital {idx} | max |psi| = {np.max(np.abs(data.values)):.3f} | spacing={spacing:.2f} Å | smooth={int(smooth_passes or 0)} | points={data.grid.shape[0]} | bonds={bond_count} | zoom×={zoom_factor:.2f} | showing 0..{n_mo_display-1} of {n_mo}"
         if mo_energies is not None:
             info += f" | energy = {mo_energies[idx]:.6f} a.u."
