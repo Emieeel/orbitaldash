@@ -14,12 +14,17 @@ Units:
 import numpy as np
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, Any, Callable
+import threading
+import logging
+import time
 
 from .geometry import Molecule, standardize_geometry
 
 # Unit conversion constants
 BOHR_TO_ANG = 0.529177210903
 ANG_TO_BOHR = 1.0 / BOHR_TO_ANG
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -234,7 +239,15 @@ class OrbitalEvaluator:
         spacing: Initial grid spacing in Angstrom.
     """
 
-    def __init__(self, geometry, basis: Any, mo_coeff: np.ndarray, custom_eval: Optional[Callable[[np.ndarray], np.ndarray]] = None, spacing: float = 0.3):
+    def __init__(
+        self,
+        geometry,
+        basis: Any,
+        mo_coeff: np.ndarray,
+        custom_eval: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+        spacing: float = 0.3,
+        verbose: bool = False,
+    ):
         self.mol = standardize_geometry(geometry)
         self.basis = basis  # may be a basis string or a PySCF mol object
         self.mo_coeff = mo_coeff
@@ -243,6 +256,10 @@ class OrbitalEvaluator:
                                          np.ndarray, Tuple[int, int, int], float]] = None
         self._custom_eval = custom_eval
         self._spacing = spacing
+        self._verbose = bool(verbose)
+        # Dash callbacks may be processed concurrently (threaded Flask server).
+        # Guard grid/caches so we never mix a grid snapshot with values from another.
+        self._lock = threading.RLock()
 
     def grid(self) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int, int], float]:
         """Get or build the current grid.
@@ -254,9 +271,20 @@ class OrbitalEvaluator:
                 - steps: Number of steps in each dimension (nx, ny, nz).
                 - spacing: The spacing used (Å).
         """
-        if self._grid_cache is None:
-            self._grid_cache = make_grid(self.mol, spacing=self._spacing)
-        return self._grid_cache
+        with self._lock:
+            if self._grid_cache is None:
+                t0 = time.perf_counter()
+                self._grid_cache = make_grid(self.mol, spacing=self._spacing)
+                if self._verbose:
+                    grid, _origin, steps, spacing = self._grid_cache
+                    logger.info(
+                        "Grid built: spacing=%.3f Å steps=%s points=%d (%.2f ms)",
+                        float(spacing),
+                        steps,
+                        int(grid.shape[0]),
+                        1e3 * (time.perf_counter() - t0),
+                    )
+            return self._grid_cache
 
     def regrid(self, spacing: float):
         """Change grid spacing (resolution) and clear caches.
@@ -269,13 +297,17 @@ class OrbitalEvaluator:
         Raises:
             ValueError: If ``spacing`` is not positive.
         """
-        if spacing <= 0:
-            raise ValueError("spacing must be positive")
-        if abs(spacing - self._spacing) < 1e-9:
-            return  # no change
-        self._spacing = spacing
-        self._grid_cache = None
-        self._cache.clear()
+        with self._lock:
+            if spacing <= 0:
+                raise ValueError("spacing must be positive")
+            if abs(spacing - self._spacing) < 1e-9:
+                return  # no change
+            if self._verbose:
+                logger.info("Regrid: %.3f Å -> %.3f Å",
+                            float(self._spacing), float(spacing))
+            self._spacing = spacing
+            self._grid_cache = None
+            self._cache.clear()
 
     def mo_values(self, idx: int) -> np.ndarray:
         """Get MO values for the selected index on the current grid.
@@ -289,18 +321,28 @@ class OrbitalEvaluator:
         Returns:
             np.ndarray: Flattened values on the grid with shape (P,).
         """
-        if idx in self._cache:
-            return self._cache[idx]
-        grid, _, _, _ = self.grid()
-        if self._custom_eval is not None:
-            mo_vals = self._custom_eval(grid)[:, idx]
-        else:
-            # Efficient path: evaluate only the requested orbital using chunked AO evaluation
-            mo_vec = self.mo_coeff[:, idx]
-            mo_vals = evaluate_mo_on_grid_single(
-                self.mol, self.basis, mo_vec, grid)
-        self._cache[idx] = mo_vals
-        return mo_vals
+        with self._lock:
+            if idx in self._cache:
+                return self._cache[idx]
+            grid, _, _, _ = self.grid()
+            t0 = time.perf_counter()
+            if self._custom_eval is not None:
+                mo_vals = self._custom_eval(grid)[:, idx]
+            else:
+                # Efficient path: evaluate only the requested orbital using chunked AO evaluation
+                mo_vec = self.mo_coeff[:, idx]
+                mo_vals = evaluate_mo_on_grid_single(
+                    self.mol, self.basis, mo_vec, grid)
+            self._cache[idx] = mo_vals
+            if self._verbose:
+                logger.info(
+                    "MO %d evaluated: points=%d max|psi|=%.6g (%.2f ms)",
+                    int(idx),
+                    int(mo_vals.shape[0]),
+                    float(np.max(np.abs(mo_vals))) if mo_vals.size else 0.0,
+                    1e3 * (time.perf_counter() - t0),
+                )
+            return mo_vals
 
     def orbital_data(self, idx: int, isovalue: Optional[float] = None) -> OrbitalData:
         """Construct an :class:`OrbitalData` bundle for a given orbital.
@@ -313,8 +355,14 @@ class OrbitalEvaluator:
         Returns:
             OrbitalData: Grid, values, origin, steps, and spacing.
         """
-        grid, origin, steps, spacing = self.grid()
-        vals = self.mo_values(idx)
-        if isovalue is None:
-            isovalue = get_orbital_isovalue(vals)
-        return OrbitalData(grid=grid, values=vals, origin=origin, steps=steps, spacing=spacing)
+        # Ensure grid + values are from the same snapshot.
+        with self._lock:
+            grid, origin, steps, spacing = self.grid()
+            vals = self.mo_values(idx)
+            if vals.shape[0] != grid.shape[0]:
+                # Defensive recovery: clear this orbital cache and recompute.
+                self._cache.pop(idx, None)
+                vals = self.mo_values(idx)
+            if isovalue is None:
+                isovalue = get_orbital_isovalue(vals)
+            return OrbitalData(grid=grid, values=vals, origin=origin, steps=steps, spacing=spacing)

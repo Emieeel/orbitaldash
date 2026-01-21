@@ -20,7 +20,41 @@ Notes:
 
 import numpy as np
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple, Union
+from typing import List, Sequence, Tuple, Union, overload, Literal
+
+
+def _estimate_bond_order(_zi: int, _zj: int, distance: float, ri: float, rj: float, max_order: int = 3) -> int:
+    """Estimate a bond order (1/2/3) from interatomic distance.
+
+    This is a heuristic intended for visualization only.
+
+    The classifier uses the ratio r = d / (ri + rj). Roughly:
+      - r < 0.85 -> triple
+      - r < 0.95 -> double
+      - else -> single
+
+    Args:
+        zi, zj: Atomic numbers.
+        distance: Interatomic distance in Angstrom.
+        ri, rj: Covalent radii used for baseline (Angstrom).
+        max_order: Maximum bond order to return.
+
+    Returns:
+        int: Estimated bond order in [1, max_order].
+    """
+    denom = float(ri + rj)
+    if denom <= 1e-12:
+        return 1
+    ratio = float(distance) / denom
+    order = 1
+    if ratio < 0.85:
+        order = 3
+    elif ratio < 0.95:
+        order = 2
+    if max_order < 1:
+        return 1
+    return int(max(1, min(int(max_order), order)))
+
 
 # Basic element data (subset extended with common elements)
 # Colors aim to follow Jmol/CPK defaults for familiarity.
@@ -135,7 +169,15 @@ class Molecule:
             Z.append(_SYMBOL_TO_Z[s])
         return np.array(Z, dtype=int)
 
-    def infer_bonds(self, scale: float = 1.2) -> List[Tuple[int, int]]:
+    @overload
+    def infer_bonds(self, scale: float = 1.2, *,
+                    with_order: Literal[False] = False) -> List[Tuple[int, int]]: ...
+
+    @overload
+    def infer_bonds(self, scale: float = 1.2, *,
+                    with_order: Literal[True], max_order: int = 3) -> List[Tuple[int, int, int]]: ...
+
+    def infer_bonds(self, scale: float = 1.2, *, with_order: bool = False, max_order: int = 3):
         """Infer covalent bonds using radii and a distance cutoff.
 
         The cutoff for two atoms i and j is computed as:
@@ -144,19 +186,31 @@ class Molecule:
 
         Args:
             scale: Multiplicative factor applied to the sum of covalent radii.
+            with_order: If True, return (i, j, order) tuples where order is a
+                rough estimate of bond multiplicity (1/2/3) based on distance.
+            max_order: Maximum bond order to return when ``with_order`` is True.
 
         Returns:
-            List[Tuple[int, int]]: Pairs of atom indices (i, j) with i < j.
+            If ``with_order`` is False (default):
+                List[Tuple[int, int]] of pairs (i, j) with i < j.
+            If ``with_order`` is True:
+                List[Tuple[int, int, int]] of (i, j, order).
         """
         Z = self.atomic_numbers
-        bonds = []
+        bonds: list = []
         for i in range(len(Z)):
             for j in range(i+1, len(Z)):
                 ri = COVALENT_RADII.get(int(Z[i]), 0.7)
                 rj = COVALENT_RADII.get(int(Z[j]), 0.7)
                 cutoff = scale * (ri + rj)
-                if np.linalg.norm(self.coords[i] - self.coords[j]) <= cutoff:
-                    bonds.append((i, j))
+                d = float(np.linalg.norm(self.coords[i] - self.coords[j]))
+                if d <= cutoff:
+                    if with_order:
+                        order = _estimate_bond_order(int(Z[i]), int(
+                            Z[j]), d, ri, rj, max_order=int(max_order))
+                        bonds.append((i, j, order))
+                    else:
+                        bonds.append((i, j))
         return bonds
 
     def to_dict(self):

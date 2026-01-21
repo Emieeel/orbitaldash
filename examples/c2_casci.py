@@ -47,7 +47,7 @@ def run_reordered_mo():
     mycas.kernel(mo)  # type: ignore[attr-defined]
 
     # Launch with the reordered MO matrix. The viewer will render in the mo order provided.
-    return launch_app(mycas, mo_coeff=mo, auto_run=False), mo
+    return launch_app(mycas, mo_coeff=mo, auto_run=False, port=8055), mo
 
 
 def run_hf_order_with_active():
@@ -71,7 +71,7 @@ def run_hf_order_with_active():
     # the default CASCI mycas.mo_coeff (which matches HF order for CASCI) and
     # highlights the requested active orbitals in that order.
 
-    return launch_app(mycas, active=act_idx, auto_run=False), myhf.mo_coeff
+    return launch_app(mycas, active=act_idx, auto_run=False, port=8056), myhf.mo_coeff
 
 
 # if __name__ == "__main__":
