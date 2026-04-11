@@ -432,3 +432,230 @@ def test_smooth_field_separable_branches():
     out1 = _smooth_field_separable(V, passes=1)
     assert out1.shape == V.shape
     assert float(out1.max()) <= 1.0
+
+
+def _make_h2_trajectory(n_frames: int = 5):
+    rs = np.linspace(0.6, 2.0, n_frames)
+    frames = []
+    for r in rs:
+        coords = np.array([[0.0, 0.0, -0.5 * r], [0.0, 0.0, 0.5 * r]], dtype=float)
+
+        def custom_eval_factory(rr: float):
+            centers = np.array([[0.0, 0.0, -0.5 * rr], [0.0, 0.0, 0.5 * rr]], dtype=float)
+
+            def custom_eval(grid: np.ndarray) -> np.ndarray:
+                d0 = np.linalg.norm(grid - centers[0], axis=1)
+                d1 = np.linalg.norm(grid - centers[1], axis=1)
+                phi0 = np.exp(-1.2 * d0)
+                phi1 = np.exp(-1.2 * d1)
+                return np.stack([phi0 + phi1, phi0 - phi1], axis=1)
+
+            return custom_eval
+
+        frames.append(
+            {
+                "geometry": {"symbols": ["H", "H"], "coords": coords},
+                "mo_coeff": np.eye(2, dtype=float),
+                "custom_eval": custom_eval_factory(float(r)),
+                "mo_energies": np.array([-0.5, 0.2], dtype=float),
+                "mo_occ": np.array([2.0, 0.0], dtype=float),
+                "metadata": {
+                    "reaction_coordinate": float(r),
+                    "energy": float((r - 0.74) ** 2 - 0.2),
+                    "pes": {"HF": float((r - 0.74) ** 2 - 0.2)},
+                },
+            }
+        )
+    return frames
+
+
+def test_trajectory_ui_contains_frame_slider_and_pes(tmp_path):
+    trajectory = _make_h2_trajectory(4)
+    app = launch_app(
+        trajectory=trajectory,
+        mode="auto",
+        cache_dir=str(tmp_path),
+        auto_run=False,
+        minimal_ui=True,
+    )
+
+    frame_slider = _find_component_by_id(app.layout, "frame-idx")
+    pes_graph = _find_component_by_id(app.layout, "pes-plot")
+    play_btn = _find_component_by_id(app.layout, "play-frames")
+    assert frame_slider is not None
+    assert pes_graph is not None
+    assert play_btn is not None
+
+
+def test_trajectory_auto_mode_builds_hdf5_cache(tmp_path):
+    trajectory = _make_h2_trajectory(4)
+    app = launch_app(
+        trajectory=trajectory,
+        mode="auto",
+        cache_dir=str(tmp_path),
+        auto_run=False,
+        minimal_ui=True,
+    )
+
+    server = make_server("127.0.0.1", 0, app.server)
+    port = int(server.server_port)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{port}"
+    try:
+        output_key = _callback_output_key(app, ["orbital-plot", "pes-plot", "camera-state"])
+        payload = _build_update_payload_from_callback(
+            app,
+            output_key,
+            overrides_by_id_prop={
+                ("frame-idx", "value"): 2,
+                ("orbital-idx", "value"): 1,
+            },
+        )
+        status, _headers, _body = _http_post_json(f"{base_url}/_dash-update-component", payload)
+        assert status == 200
+    finally:
+        server.shutdown()
+        thread.join(timeout=5.0)
+        server.server_close()
+
+    files = list(tmp_path.glob("*.h5"))
+    assert files, "Expected at least one trajectory cache file to be created"
+
+
+def test_trajectory_homo_lumo_marks_change_with_frame(tmp_path):
+    def make_eval():
+        def custom_eval(grid: np.ndarray) -> np.ndarray:
+            x = grid[:, 0]
+            return np.stack([x, -x, 0.5 * x], axis=1)
+
+        return custom_eval
+
+    trajectory = [
+        {
+            "geometry": {"symbols": ["H", "H"], "coords": np.array([[0.0, 0.0, -0.4], [0.0, 0.0, 0.4]])},
+            "mo_coeff": np.eye(3, dtype=float),
+            "custom_eval": make_eval(),
+            "mo_energies": np.array([-0.8, -0.2, 0.1], dtype=float),
+            "mo_occ": np.array([2.0, 0.0, 0.0], dtype=float),
+            "metadata": {"energy": -1.0, "reaction_coordinate": 0.0, "pes": {"HF": -1.0}},
+        },
+        {
+            "geometry": {"symbols": ["H", "H"], "coords": np.array([[0.0, 0.0, -0.7], [0.0, 0.0, 0.7]])},
+            "mo_coeff": np.eye(3, dtype=float),
+            "custom_eval": make_eval(),
+            "mo_energies": np.array([-1.1, -0.3, 0.2], dtype=float),
+            "mo_occ": np.array([2.0, 2.0, 0.0], dtype=float),
+            "metadata": {"energy": -0.9, "reaction_coordinate": 1.0, "pes": {"HF": -0.9}},
+        },
+    ]
+
+    app = launch_app(
+        trajectory=trajectory,
+        mode="lazy",
+        cache_dir=str(tmp_path),
+        auto_run=False,
+        minimal_ui=True,
+    )
+
+    server = make_server("127.0.0.1", 0, app.server)
+    port = int(server.server_port)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{port}"
+    try:
+        output_key = _callback_output_key(app, ["orbital-idx", "marks"])
+
+        p0 = {
+            "output": output_key,
+            "outputs": {"id": "orbital-idx", "property": "marks"},
+            "inputs": [{"id": "frame-idx", "property": "value", "value": 0}],
+            "state": [],
+            "changedPropIds": ["frame-idx.value"],
+        }
+        s0, _h0, b0 = _http_post_json(f"{base_url}/_dash-update-component", p0)
+        assert s0 == 200
+        r0 = json.loads(b0.decode("utf-8"))
+        m0 = r0.get("response", {}).get("orbital-idx", {}).get("marks", {})
+
+        p1 = {
+            "output": output_key,
+            "outputs": {"id": "orbital-idx", "property": "marks"},
+            "inputs": [{"id": "frame-idx", "property": "value", "value": 1}],
+            "state": [],
+            "changedPropIds": ["frame-idx.value"],
+        }
+        s1, _h1, b1 = _http_post_json(f"{base_url}/_dash-update-component", p1)
+        assert s1 == 200
+        r1 = json.loads(b1.decode("utf-8"))
+        m1 = r1.get("response", {}).get("orbital-idx", {}).get("marks", {})
+    finally:
+        server.shutdown()
+        thread.join(timeout=5.0)
+        server.server_close()
+
+    assert m0.get("0", {}).get("label") == "H"
+    assert m0.get("1", {}).get("label") == "L"
+    assert m1.get("1", {}).get("label") == "H"
+    assert m1.get("2", {}).get("label") == "L"
+
+
+def test_trajectory_quality_slider_disabled_when_single_spacing(tmp_path):
+    trajectory = _make_h2_trajectory(3)
+    app = launch_app(
+        trajectory=trajectory,
+        mode="precomputed",
+        cache_dir=str(tmp_path),
+        auto_run=False,
+        minimal_ui=True,
+    )
+
+    quality = _find_component_by_id(app.layout, "quality")
+    assert quality is not None
+    assert bool(getattr(quality, "disabled", False)) is True
+
+
+def test_trajectory_quality_slider_enabled_with_spacing_options(tmp_path):
+    trajectory = _make_h2_trajectory(3)
+    app = launch_app(
+        trajectory=trajectory,
+        mode="precomputed",
+        cache_dir=str(tmp_path),
+        spacing_options=[0.30, 0.25, 0.20],
+        auto_run=False,
+        minimal_ui=True,
+    )
+
+    quality = _find_component_by_id(app.layout, "quality")
+    assert quality is not None
+    assert bool(getattr(quality, "disabled", False)) is False
+    marks = getattr(quality, "marks", {})
+    txt = json.dumps(marks)
+    assert "0.30" in txt
+    assert "0.25" in txt
+    assert "0.20" in txt
+
+
+def test_trajectory_pes_uses_user_labels(tmp_path):
+    trajectory = _make_h2_trajectory(3)
+    for i, frame in enumerate(trajectory):
+        e = float(frame["metadata"]["pes"]["HF"])
+        frame["metadata"]["pes"] = {
+            "DFT": e,
+            "CASSCF": e - 0.02 - 0.001 * i,
+        }
+
+    app = launch_app(
+        trajectory=trajectory,
+        mode="auto",
+        cache_dir=str(tmp_path),
+        auto_run=False,
+        minimal_ui=True,
+    )
+
+    pes_graph = _find_component_by_id(app.layout, "pes-plot")
+    assert pes_graph is not None
+    figure = getattr(pes_graph, "figure", None)
+    fig_json = json.dumps(figure.to_dict() if figure is not None else {})
+    assert "DFT PES" in fig_json
+    assert "CASSCF PES" in fig_json

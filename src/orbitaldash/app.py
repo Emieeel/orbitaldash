@@ -13,12 +13,23 @@ import numpy as np
 from typing import Optional, Any, Callable
 import logging
 import inspect
+from pathlib import Path
 
 from .geometry import standardize_geometry, ELEMENT_COLORS, COVALENT_RADII
-from .orbitals import OrbitalEvaluator, OrbitalData
+from .orbitals import (
+    OrbitalEvaluator,
+    OrbitalData,
+    evaluate_mo_on_grid_single,
+    make_global_grid,
+    precompute_trajectory_to_hdf5,
+    load_trajectory_hdf5_grid,
+    load_trajectory_hdf5_values,
+    trajectory_cache_key,
+)
+from .trajectory import standardize_trajectory, frame_reaction_coordinates
 
 import dash
-from dash import dcc, html, Input, Output
+from dash import dcc, html, Input, Output, State, no_update
 import plotly.graph_objects as go
 
 logger = logging.getLogger(__name__)
@@ -357,6 +368,13 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
                active: Optional[list[int]] = None,
                custom_eval: Optional[Callable[[
                    np.ndarray], np.ndarray]] = None,
+               trajectory: Optional[Any] = None,
+               mode: str = 'auto',
+               cache_dir: Optional[str] = None,
+               precomputed_h5_path: Optional[str] = None,
+               rebuild_cache: bool = False,
+               cache_key: Optional[str] = None,
+               spacing_options: Optional[list[float]] = None,
                host='127.0.0.1', port=8050, auto_run: bool = True, debug: bool = False,
                max_orbitals: Optional[int] = 70,
                verbose: bool = False,
@@ -383,9 +401,17 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
         active: Optional list of orbital indices to highlight as "active" in the UI. If a CASCI object
             is passed, and this is None, it will default to the CAS active space indices [ncore .. ncore+ncas-1].
         custom_eval: Optional callable mapping grid (P, 3) to MO values (P, n_mo).
+        trajectory: Optional trajectory input. For PES plotting, each frame metadata
+            must include:
+            ``metadata['pes'] = {'LabelA': energy_a, 'LabelB': energy_b, ...}``
+            Any provided labels are plotted.
         host: Host interface for the Dash server.
         port: Port for the Dash server.
         auto_run: Whether to immediately start the server.
+        spacing_options: Optional selectable grid spacings (Angstrom) for the quality slider.
+            In trajectory mode with ``mode`` = ``precomputed`` or ``auto``:
+            - if provided, these spacings become selectable quality levels;
+            - if omitted, a single default spacing is used and the quality slider is disabled.
         debug: Enable debug styling for bonds.
         max_orbitals: Cap how many orbitals are exposed in the UI.
         jupyter: If True, attempt to run inside a Jupyter notebook (inline/external) when supported by Dash.
@@ -398,55 +424,125 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
     Returns:
         dash.Dash: The configured Dash application instance.
     """
-    # Allow passing a PySCF SCF object directly as the first argument, e.g. launch_app(mf)
-    # We detect by duck-typing to avoid importing pyscf unless needed.
-    if geometry is not None and not isinstance(geometry, dict):
-        # Detect a PySCF-like object by presence of required attributes
-        if hasattr(geometry, 'mo_coeff') and hasattr(geometry, 'mol'):
-            obj = geometry  # type: ignore[assignment]
-            pyscf_mol = getattr(obj, 'mol')
-            # Extract geometry in Angstrom
-            try:
-                coords_ang = pyscf_mol.atom_coords(unit='Angstrom')
-            except Exception:
-                # Fallback: request Bohr and convert locally
-                BOHR_TO_ANG = 0.529177210903
-                coords_ang = pyscf_mol.atom_coords(unit='Bohr') * BOHR_TO_ANG
-            # Prefer pure symbols if available
-            try:
-                symbols = [pyscf_mol.atom_pure_symbol(
-                    i) for i in range(pyscf_mol.natm)]
-            except Exception:
-                symbols = [pyscf_mol.atom_symbol(i)
-                           for i in range(pyscf_mol.natm)]
-            geometry = {"symbols": symbols, "coords": coords_ang}
-            basis = pyscf_mol
-            # Only override mo_* when not explicitly provided
-            if mo_coeff is None:
-                mo_coeff = getattr(obj, 'mo_coeff')
-            if mo_energies is None and hasattr(obj, 'mo_energy'):
-                mo_energies = getattr(obj, 'mo_energy')
-            if mo_occ is None and hasattr(obj, 'mo_occ'):
-                mo_occ = getattr(obj, 'mo_occ')
-            # If this is a CASCI object (duck-type via ncore/ncas), build default active indices
-            if active is None and hasattr(obj, 'ncore') and hasattr(obj, 'ncas'):
-                try:
-                    ncore = int(getattr(obj, 'ncore'))
-                    ncas = int(getattr(obj, 'ncas'))
-                    active = list(range(ncore, ncore + ncas))
-                except Exception:
-                    active = None
+    mode = str(mode).lower().strip()
+    if mode not in {'auto', 'lazy', 'precomputed'}:
+        raise ValueError("mode must be one of: 'auto', 'lazy', 'precomputed'")
 
-    # Standardize geometry path (works for both dict and Molecule inputs)
-    if geometry is None:
-        raise ValueError(
-            "geometry must be provided, or pass a PySCF SCF object as the first argument to launch_app(mf)")
-    mol = standardize_geometry(geometry)
-    if mo_coeff is None:
-        raise ValueError(
-            "mo_coeff must be provided unless a PySCF SCF object is passed as the first argument")
-    mo_coeff = np.asarray(mo_coeff)
-    n_mo = mo_coeff.shape[1]
+    trajectory_mode = trajectory is not None
+    traj = None
+    frames = []
+    frame_molecules = []
+    traj_pes_series: dict[str, np.ndarray] = {}
+    traj_rc = np.array([], dtype=float)
+
+    if trajectory_mode:
+        traj = standardize_trajectory(trajectory, default_basis=basis)
+        frames = list(traj.frames)
+        frame_molecules = [standardize_geometry(f.geometry) for f in frames]
+        if not frame_molecules:
+            raise ValueError("trajectory must contain at least one frame")
+        missing_occ_or_energy = [
+            i for i, f in enumerate(frames)
+            if (f.mo_occ is None or f.mo_energies is None)
+        ]
+        if missing_occ_or_energy:
+            bad = ", ".join(str(i) for i in missing_occ_or_energy[:8])
+            raise ValueError(
+                "trajectory mode requires mo_energies and mo_occ for each frame "
+                f"(missing in frame indices: {bad})"
+            )
+        mol = frame_molecules[0]
+        n_mo = min(int(np.asarray(f.mo_coeff).shape[1]) for f in frames)
+        # PES series from frame metadata; required form per frame:
+        # metadata["pes"] = {"HF": ..., "CASCI": ..., "DFT": ...}
+        missing_pes = [
+            i for i, f in enumerate(frames)
+            if not isinstance((f.metadata or {}).get('pes'), dict)
+        ]
+        if missing_pes:
+            bad = ", ".join(str(i) for i in missing_pes[:8])
+            raise ValueError(
+                "trajectory mode requires metadata['pes'] mapping in each frame "
+                f"(missing in frame indices: {bad})"
+            )
+
+        labels: list[str] = []
+        for f in frames:
+            md = f.metadata or {}
+            pes = md.get('pes')
+            assert isinstance(pes, dict)
+            for key in pes.keys():
+                s = str(key)
+                if s not in labels:
+                    labels.append(s)
+        if not labels:
+            raise ValueError("metadata['pes'] must contain at least one energy label")
+
+        for lbl in labels:
+            vals: list[float] = []
+            for f in frames:
+                md = f.metadata or {}
+                pes = md.get('pes')
+                v = None
+                if isinstance(pes, dict) and lbl in pes:
+                    v = pes.get(lbl)
+                vals.append(float(v) if v is not None else np.nan)
+            arr = np.asarray(vals, dtype=float)
+            if np.any(~np.isnan(arr)):
+                traj_pes_series[lbl] = arr
+        if not traj_pes_series:
+            raise ValueError("metadata['pes'] does not contain any numeric values across frames")
+        traj_rc = frame_reaction_coordinates(traj)
+    else:
+        # Allow passing a PySCF SCF object directly as the first argument, e.g. launch_app(mf)
+        # We detect by duck-typing to avoid importing pyscf unless needed.
+        if geometry is not None and not isinstance(geometry, dict):
+            # Detect a PySCF-like object by presence of required attributes
+            if hasattr(geometry, 'mo_coeff') and hasattr(geometry, 'mol'):
+                obj = geometry  # type: ignore[assignment]
+                pyscf_mol = getattr(obj, 'mol')
+                # Extract geometry in Angstrom
+                try:
+                    coords_ang = pyscf_mol.atom_coords(unit='Angstrom')
+                except Exception:
+                    # Fallback: request Bohr and convert locally
+                    BOHR_TO_ANG = 0.529177210903
+                    coords_ang = pyscf_mol.atom_coords(unit='Bohr') * BOHR_TO_ANG
+                # Prefer pure symbols if available
+                try:
+                    symbols = [pyscf_mol.atom_pure_symbol(
+                        i) for i in range(pyscf_mol.natm)]
+                except Exception:
+                    symbols = [pyscf_mol.atom_symbol(i)
+                               for i in range(pyscf_mol.natm)]
+                geometry = {"symbols": symbols, "coords": coords_ang}
+                basis = pyscf_mol
+                # Only override mo_* when not explicitly provided
+                if mo_coeff is None:
+                    mo_coeff = getattr(obj, 'mo_coeff')
+                if mo_energies is None and hasattr(obj, 'mo_energy'):
+                    mo_energies = getattr(obj, 'mo_energy')
+                if mo_occ is None and hasattr(obj, 'mo_occ'):
+                    mo_occ = getattr(obj, 'mo_occ')
+                # If this is a CASCI object (duck-type via ncore/ncas), build default active indices
+                if active is None and hasattr(obj, 'ncore') and hasattr(obj, 'ncas'):
+                    try:
+                        ncore = int(getattr(obj, 'ncore'))
+                        ncas = int(getattr(obj, 'ncas'))
+                        active = list(range(ncore, ncore + ncas))
+                    except Exception:
+                        active = None
+
+        # Standardize geometry path (works for both dict and Molecule inputs)
+        if geometry is None:
+            raise ValueError(
+                "geometry must be provided, or pass a PySCF SCF object as the first argument to launch_app(mf)")
+        mol = standardize_geometry(geometry)
+        if mo_coeff is None:
+            raise ValueError(
+                "mo_coeff must be provided unless a PySCF SCF object is passed as the first argument")
+        mo_coeff = np.asarray(mo_coeff)
+        n_mo = int(np.asarray(mo_coeff).shape[1])
     # Limit how many orbitals are exposed in the UI by default to keep it usable
     if max_orbitals is not None:
         try:
@@ -456,8 +552,94 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
     else:
         n_mo_display = n_mo
     # If custom_eval is provided, OrbitalEvaluator will use it and not require PySCF.
-    evaluator = OrbitalEvaluator(
-        mol, basis, mo_coeff, custom_eval=custom_eval, verbose=bool(verbose))
+    evaluator = None
+    if not trajectory_mode:
+        assert mo_coeff is not None
+        evaluator = OrbitalEvaluator(
+            mol, basis, mo_coeff, custom_eval=custom_eval, verbose=bool(verbose))
+
+    def _spacing_tag(spacing: float) -> str:
+        return f"{float(spacing):.3f}".replace('.', 'p')
+
+    def _build_precomputed_path(spacing: float) -> str:
+        sp_tag = _spacing_tag(spacing)
+        if precomputed_h5_path:
+            p = Path(precomputed_h5_path)
+            if p.suffix.lower() == '.h5':
+                if len(quality_values) <= 1:
+                    return str(p)
+                return str(p.with_name(f"{p.stem}_s{sp_tag}{p.suffix}"))
+            # Treat non-.h5 path as a directory when multiple spacing caches are needed.
+            p.mkdir(parents=True, exist_ok=True)
+            if cache_key:
+                key = str(cache_key)
+            else:
+                assert traj is not None
+                key = trajectory_cache_key(traj, spacing=float(spacing), padding=3.0)
+            return str(p / f"trajectory_{key}_s{sp_tag}.h5")
+        base_dir = Path(cache_dir or ".orbitaldash_cache")
+        if cache_key:
+            key = str(cache_key)
+        else:
+            assert traj is not None
+            key = trajectory_cache_key(traj, spacing=float(spacing), padding=3.0)
+        return str(base_dir / f"trajectory_{key}_s{sp_tag}.h5")
+
+    _traj_grid_cache: dict[float, tuple[np.ndarray, np.ndarray, tuple[int, int, int], float]] = {}
+    _traj_vals_cache: dict[tuple[float, int, int], np.ndarray] = {}
+    _traj_h5_by_spacing: dict[float, str] = {}
+
+    def _ensure_h5(spacing: float) -> str:
+        if float(spacing) in _traj_h5_by_spacing and not rebuild_cache:
+            return _traj_h5_by_spacing[float(spacing)]
+        assert traj is not None
+        path = _build_precomputed_path(spacing)
+        needs_build = rebuild_cache or (not Path(path).exists())
+        if needs_build:
+            precompute_trajectory_to_hdf5(
+                traj,
+                h5_path=path,
+                spacing=float(spacing),
+                padding=3.0,
+                verbose=bool(verbose),
+            )
+        _traj_h5_by_spacing[float(spacing)] = path
+        return path
+
+    def _trajectory_grid(spacing: float):
+        sp = float(spacing)
+        if sp in _traj_grid_cache and not rebuild_cache:
+            return _traj_grid_cache[sp]
+        if mode in {'auto', 'precomputed'}:
+            h5_path = _ensure_h5(sp)
+            out = load_trajectory_hdf5_grid(h5_path)
+        else:
+            assert frame_molecules
+            out = make_global_grid(frame_molecules, padding=3.0, spacing=sp)
+        _traj_grid_cache[sp] = out
+        return out
+
+    def _trajectory_values(frame_idx: int, orbital_idx: int, spacing: float) -> np.ndarray:
+        sp = float(spacing)
+        key = (sp, int(frame_idx), int(orbital_idx))
+        if key in _traj_vals_cache and not rebuild_cache:
+            return _traj_vals_cache[key]
+
+        if mode in {'auto', 'precomputed'}:
+            h5_path = _ensure_h5(sp)
+            vals = load_trajectory_hdf5_values(h5_path, frame_idx=frame_idx, orbital_idx=orbital_idx)
+        else:
+            grid, _origin, _steps, _ = _trajectory_grid(sp)
+            frame = frames[int(frame_idx)]
+            coeff = np.asarray(frame.mo_coeff)
+            orb_idx = int(max(0, min(orbital_idx, coeff.shape[1] - 1)))
+            if frame.custom_eval is not None:
+                vals = np.asarray(frame.custom_eval(grid)[:, orb_idx], dtype=float)
+            else:
+                vals = evaluate_mo_on_grid_single(frame_molecules[int(frame_idx)], frame.basis, coeff[:, orb_idx], grid)
+
+        _traj_vals_cache[key] = vals
+        return vals
 
     # Determine initial orbital index and compute HOMO/LUMO for marks
     # HOMO definition (requested): orbital with HIGHEST energy among those with occupation > 1
@@ -465,12 +647,24 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
     initial_idx = 0
     homo_idx: Optional[int] = None
     lumo_idx: Optional[int] = None
-    if mo_occ is not None:
+    occ_for_marks: Optional[np.ndarray] = None
+    en_for_marks: Optional[np.ndarray] = None
+    if trajectory_mode and frames:
+        if frames[0].mo_occ is not None:
+            occ_for_marks = np.asarray(frames[0].mo_occ).reshape(-1)
+        if frames[0].mo_energies is not None:
+            en_for_marks = np.asarray(frames[0].mo_energies).reshape(-1)
+    elif mo_occ is not None:
+        occ_for_marks = np.asarray(mo_occ).reshape(-1)
+        if mo_energies is not None:
+            en_for_marks = np.asarray(mo_energies).reshape(-1)
+
+    if occ_for_marks is not None:
         try:
-            occ = np.asarray(mo_occ).reshape(-1)
+            occ = occ_for_marks
             if occ.shape[0] == n_mo:
-                if mo_energies is not None and np.asarray(mo_energies).shape[0] == n_mo:
-                    en = np.asarray(mo_energies).reshape(-1)
+                if en_for_marks is not None and en_for_marks.shape[0] == n_mo:
+                    en = en_for_marks
                     occ_mask = occ > 1.0
                     virt_mask = occ <= 1.0
                     if np.any(occ_mask):
@@ -497,14 +691,31 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
     use_jupyter = _running_in_notebook() if jupyter is None else bool(jupyter)
     use_minimal_ui = (use_jupyter if minimal_ui is None else bool(minimal_ui))
 
-    # Quality slider spacings from 0.5 to 0.1 step 0.05 (0.5,0.45,...,0.1)
-    quality_values = [round(x, 2) for x in np.arange(0.5, 0.099, -0.05)]
-    quality_marks = {i: f"{s:.2f}" for i, s in enumerate(quality_values)}
-
-    # Heuristic: if AO count is huge (e.g., uncontracted on large systems), start at a coarser grid
-    # We infer AO count from mo_coeff rows
-    n_ao = mo_coeff.shape[0]
+    # Heuristic: if AO count is huge (e.g., uncontracted on large systems), start at a coarser grid.
+    if trajectory_mode:
+        n_ao = int(np.asarray(frames[0].mo_coeff).shape[0])
+    else:
+        assert mo_coeff is not None
+        n_ao = int(mo_coeff.shape[0])
     coarse_default = 0.25 if n_ao < 400 else (0.3 if n_ao < 800 else 0.35)
+
+    # Quality slider options: in precomputed trajectory mode, use requested spacing set
+    # (or one default spacing if none supplied), and disable slider when there is only one.
+    if trajectory_mode and mode in {'auto', 'precomputed'}:
+        if spacing_options:
+            raw = [float(s) for s in spacing_options if float(s) > 0]
+            if not raw:
+                raise ValueError("spacing_options must contain positive values")
+            quality_values = sorted({round(v, 3) for v in raw}, reverse=True)
+        else:
+            quality_values = [round(float(coarse_default), 3)]
+    else:
+        # Legacy interactive quality list.
+        quality_values = [round(x, 2) for x in np.arange(0.5, 0.099, -0.05)]
+
+    quality_marks = {i: f"{s:.2f}" for i, s in enumerate(quality_values)}
+    quality_slider_disabled = len(quality_values) <= 1
+
     try:
         default_quality_index = quality_values.index(coarse_default)
     except ValueError:
@@ -512,10 +723,46 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
         default_quality_index = min(range(len(quality_values)), key=lambda i: abs(
             quality_values[i]-coarse_default))
 
+    if trajectory_mode and mode == 'precomputed':
+        # Ensure all selected quality levels are available for smooth switching.
+        for sp in quality_values:
+            _ensure_h5(float(sp))
+
     # Normalize active indices to a set for quick membership checks
     active_set = set(int(i) for i in (active or []) if 0 <= int(i) < n_mo)
 
-    def _orbital_marks(n: int):
+    def _compute_homo_lumo(occ: np.ndarray, en: Optional[np.ndarray], n: int) -> tuple[Optional[int], Optional[int], int]:
+        """Return HOMO/LUMO indices and suggested initial orbital index."""
+        homo_local: Optional[int] = None
+        lumo_local: Optional[int] = None
+        initial_local = 0
+        if occ.shape[0] < n:
+            return homo_local, lumo_local, initial_local
+        occ = occ[:n]
+        en_eff: Optional[np.ndarray] = None
+        if en is not None and en.shape[0] >= n:
+            en_eff = en[:n]
+
+        if en_eff is not None:
+            occ_mask = occ > 1.0
+            virt_mask = occ <= 1.0
+            if np.any(occ_mask):
+                occ_idx = np.where(occ_mask)[0]
+                homo_local = int(occ_idx[np.argmax(en_eff[occ_idx])])
+                initial_local = homo_local
+            if np.any(virt_mask):
+                virt_idx = np.where(virt_mask)[0]
+                lumo_local = int(virt_idx[np.argmin(en_eff[virt_idx])])
+        else:
+            occupied = np.where(occ > 1.0)[0]
+            if occupied.size > 0:
+                homo_local = int(occupied.max())
+                initial_local = homo_local
+                if homo_local + 1 < n:
+                    lumo_local = homo_local + 1
+        return homo_local, lumo_local, initial_local
+
+    def _orbital_marks(n: int, homo_mark: Optional[int], lumo_mark: Optional[int]):
         # Reduce label clutter for large numbers of orbitals
         if n <= 20:
             step = 1
@@ -530,11 +777,11 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
         if (n - 1) not in marks:
             marks[n - 1] = {"label": str(n - 1)}
         # HOMO/LUMO markers
-        if homo_idx is not None and 0 <= homo_idx < n:
-            marks[homo_idx] = {"label": "H", "style": {
+        if homo_mark is not None and 0 <= homo_mark < n:
+            marks[homo_mark] = {"label": "H", "style": {
                 "color": "#2e7d32", "fontWeight": "bold"}}
-        if lumo_idx is not None and 0 <= lumo_idx < n:
-            marks[lumo_idx] = {"label": "L", "style": {
+        if lumo_mark is not None and 0 <= lumo_mark < n:
+            marks[lumo_mark] = {"label": "L", "style": {
                 "color": "#6a1b9a", "fontWeight": "bold"}}
         # Active orbital dots (orange) – append dot if a label exists, otherwise just a dot
         for a in sorted(active_set):
@@ -552,8 +799,14 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
     # Fix scene ranges to the molecule extents so switching orbitals doesn't
     # trigger Plotly autoscale/camera jumps (core orbitals are very small).
     pad = 2.5
-    mins = mol.coords.min(axis=0) - pad
-    maxs = mol.coords.max(axis=0) + pad
+    if trajectory_mode:
+        mins = np.min(np.stack([m.coords.min(axis=0)
+                      for m in frame_molecules], axis=0), axis=0) - pad
+        maxs = np.max(np.stack([m.coords.max(axis=0)
+                      for m in frame_molecules], axis=0), axis=0) + pad
+    else:
+        mins = mol.coords.min(axis=0) - pad
+        maxs = mol.coords.max(axis=0) + pad
     scene_ranges = {
         'x': [float(mins[0]), float(maxs[0])],
         'y': [float(mins[1]), float(maxs[1])],
@@ -561,6 +814,34 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
     }
 
     default_camera = dict(eye=dict(x=0.9, y=0.9, z=0.6))
+
+    show_pes = trajectory_mode and len(traj_pes_series) > 0
+
+    def _pes_figure(frame_idx: int):
+        if not show_pes:
+            return go.Figure()
+        any_series = next(iter(traj_pes_series.values()))
+        i = int(max(0, min(frame_idx, len(any_series) - 1)))
+        fig = go.Figure()
+        palette = ['#1f77b4', '#ff8f00', '#2e7d32', '#8e24aa', '#6d4c41', '#00897b']
+        symbols = ['circle', 'diamond', 'square', 'triangle-up', 'cross', 'x']
+        for j, (lbl, yvals) in enumerate(traj_pes_series.items()):
+            color = palette[j % len(palette)]
+            marker_symbol = symbols[j % len(symbols)]
+            fig.add_trace(go.Scatter(x=traj_rc, y=yvals,
+                          mode='lines+markers', name=f'{lbl} PES', line=dict(color=color)))
+            fig.add_trace(go.Scatter(x=[traj_rc[i]], y=[yvals[i]],
+                          mode='markers', marker=dict(size=11, color=color, symbol=marker_symbol), name=f'{lbl} current'))
+        fig.update_layout(
+            template='simple_white',
+            margin=dict(l=30, r=10, t=20, b=30),
+            height=220,
+            showlegend=True,
+            xaxis_title='Reaction coordinate',
+            yaxis_title='Energy',
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='left', x=0.0),
+        )
+        return fig
 
     # Force a light background for notebook embedding.
     # In Jupyter dark mode, the output area can be dark; Dash components may
@@ -580,21 +861,43 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
             html.H4('Orbital Viewer', style={'margin': '0.25rem 0'}),
             dcc.Store(id='camera-state',
                       data={'base_eye_norm': None, 'last_eye_norm': None, 'camera': default_camera}),
+            (dcc.Store(id='frame-play-state', data=False) if trajectory_mode else html.Div()),
+            (dcc.Interval(id='frame-interval', interval=600, n_intervals=0, disabled=True) if trajectory_mode else html.Div()),
             html.Div([
                 html.Label(
                     f'Orbital index (showing 0..{n_mo_display-1} of total {n_mo})'),
                 dcc.Slider(id='orbital-idx', min=0, max=n_mo_display-1, step=1, value=initial_idx,
-                           marks=_orbital_marks(n_mo_display)),  # type: ignore[arg-type]
+                           marks=_orbital_marks(n_mo_display, homo_idx, lumo_idx)),  # type: ignore[arg-type]
+                html.Div(style={'height': '0.35rem'}),
+                (html.Div([
+                    html.Label('Frame index'),
+                    dcc.Slider(id='frame-idx', min=0, max=len(frames)-1, step=1, value=0,
+                               marks={0: '0', len(frames)-1: str(len(frames)-1)}),
+                    html.Div([
+                        html.Button('Play', id='play-frames', n_clicks=0,
+                                    style={'marginRight': '0.4rem'}),
+                        dcc.Input(
+                            id='frame-speed',
+                            type='number',
+                            value=600,
+                            min=50,
+                            max=60000,
+                            step=50,
+                            debounce=True,
+                            style={'width': '78px', 'fontSize': '0.9em'},
+                        ),
+                        html.Span('ms', style={'marginLeft': '0.25rem', 'fontSize': '0.85em', 'color': '#555'}),
+                    ], style={'display': 'flex', 'alignItems': 'center', 'marginTop': '0.35rem'})
+                ]) if trajectory_mode else html.Div()),
                 html.Div(style={'height': '0.35rem'}),
                 html.Label('Isovalue fraction (of max)'),
                 dcc.Slider(
                     id='iso-frac',
                     min=0.03,
-                    max=0.30,
+                    max=0.80,
                     step=0.01,
                     value=0.15,
-                    marks={0.03: '0.03', 0.08: '0.08',
-                           0.15: '0.15', 0.22: '0.22', 0.30: '0.30'}
+                    marks={0.03: '0.03', 0.15: '0.15', 0.30: '0.30', 0.50: '0.50', 0.80: '0.80'}
                 ),
                 html.Div(style={'height': '0.35rem'}),
                 html.Label('Quality (grid spacing)'),
@@ -603,6 +906,7 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
                     min=0, max=len(quality_values)-1, step=1,
                     value=default_quality_index,
                     marks=quality_marks,
+                    disabled=quality_slider_disabled,
                     tooltip={'always_visible': False, 'placement': 'bottom'}
                 ),  # type: ignore[arg-type]
             ], style=responsive_container),
@@ -619,6 +923,12 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
                     'margin': '0 auto',
                 }
             ),
+            (dcc.Graph(id='pes-plot', figure=_pes_figure(0), style={
+                'height': '220px',
+                'width': '100%',
+                'maxWidth': f'{fig_width}px',
+                'margin': '0 auto',
+            }) if show_pes else html.Div()),
             html.Div(id='orbital-info',
                      style={'width': '100%', 'maxWidth': f'{fig_width}px', 'margin': '0.25rem auto 0 auto'})
         ], style={
@@ -627,26 +937,48 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
             'padding': '0.25rem 0.5rem',
         })
     else:
-        fig_height = 650
+        fig_height = 620
         app.layout = html.Div([
             html.H3('Orbital Viewer'),
             dcc.Store(id='camera-state',
                       data={'base_eye_norm': None, 'last_eye_norm': None, 'camera': default_camera}),
+            (dcc.Store(id='frame-play-state', data=False) if trajectory_mode else html.Div()),
+            (dcc.Interval(id='frame-interval', interval=600, n_intervals=0, disabled=True) if trajectory_mode else html.Div()),
             html.Div([
                 html.Div([
                     html.Label(
                         f'Orbital index (showing 0..{n_mo_display-1} of total {n_mo})'),
                     dcc.Slider(id='orbital-idx', min=0, max=n_mo_display-1, step=1, value=initial_idx,
-                               marks=_orbital_marks(n_mo_display)),  # type: ignore[arg-type]
+                               marks=_orbital_marks(n_mo_display, homo_idx, lumo_idx)),  # type: ignore[arg-type]
+                    (html.Div([
+                        html.Label('Frame index'),
+                        dcc.Slider(id='frame-idx', min=0, max=len(frames)-1, step=1, value=0,
+                                   marks={0: '0', len(frames)-1: str(len(frames)-1)}),
+                        html.Div([
+                            html.Button('Play', id='play-frames', n_clicks=0,
+                                        style={'marginRight': '0.4rem'}),
+                            dcc.Input(
+                                id='frame-speed',
+                                type='number',
+                                value=600,
+                                min=50,
+                                max=60000,
+                                step=50,
+                                debounce=True,
+                                style={'width': '78px', 'fontSize': '0.9em'},
+                            ),
+                            html.Span('ms', style={'marginLeft': '0.25rem', 'fontSize': '0.85em', 'color': '#555'}),
+                        ], style={'display': 'flex', 'alignItems': 'center', 'marginTop': '0.35rem'})
+                    ]) if trajectory_mode else html.Div()),
                     html.Label('Isovalue fraction (of max)'),
                     dcc.Slider(
                         id='iso-frac',
                         min=0.03,
-                        max=0.30,
+                           max=0.80,
                         step=0.01,
                         value=0.15,
-                        marks={0.03: '0.03', 0.08: '0.08',
-                               0.15: '0.15', 0.22: '0.22', 0.30: '0.30'}
+                           marks={0.03: '0.03', 0.15: '0.15', 0.30: '0.30',
+                               0.50: '0.50', 0.80: '0.80'}
                     ),
                     html.Div([
                         dcc.Checklist(id='label-toggle', options=[{'label': 'Labels', 'value': 'labels'}],
@@ -664,12 +996,14 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
                               show_bonds=True, debug=debug, bond_scale=bond_scale, camera=default_camera, scene_ranges=scene_ranges, height=fig_height), style={'height': f'{fig_height}px'})
                 ], style={'flex': '1'}),
                 html.Div([
+                    (dcc.Graph(id='pes-plot', figure=_pes_figure(0), style={'height': '220px', 'marginBottom': '0.5em'}) if show_pes else html.Div(style={'height': '0.5em'})),
                     html.Div([
                         html.Div([
                             html.Label('Quality (grid spacing)'),
                             dcc.Slider(id='quality', min=0, max=len(quality_values)-1, step=1,
                                        value=default_quality_index, vertical=True,
-                                       marks=quality_marks, tooltip={'always_visible': True, 'placement': 'left'})  # type: ignore[arg-type]
+                                       marks=quality_marks, disabled=quality_slider_disabled,
+                                       tooltip={'always_visible': True, 'placement': 'left'})  # type: ignore[arg-type]
                         ], style={'padding': '0 0.5em'}),
                         html.Div([
                             html.Label('Smooth (visual)'),
@@ -688,9 +1022,9 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
                             dcc.Slider(id='bond-width', min=2, max=18, step=1, value=10, vertical=True,
                                        marks={2: '2', 6: '6', 10: '10', 14: '14', 18: '18'}, tooltip={'always_visible': False, 'placement': 'left'})
                         ], style={'padding': '0 0.5em'})
-                    ], style={'display': 'flex', 'flexDirection': 'row', 'height': f'{fig_height}px'})
-                ])
-            ], style={'display': 'flex', 'flexDirection': 'row'}),
+                    ], style={'display': 'flex', 'flexDirection': 'row', 'height': f'{fig_height - 220}px', 'marginTop': '0.35em'})
+                ], style={'width': '500px', 'paddingLeft': '0.4em'})
+            ], style={'display': 'flex', 'flexDirection': 'row', 'alignItems': 'flex-start'}),
             html.Div(id='orbital-info', style={'marginTop': '0.5em'})
         ], style={
             'backgroundColor': 'white',
@@ -734,9 +1068,13 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
                     cam_out[key][comp] = v
         return cam_out if has_any else None
 
-    def _update_common(idx, iso_frac, quality_idx, smooth_passes, show_labels, show_bonds, atom_scale, bond_width, relayout, cam_state):
+    def _update_common(idx, frame_idx, iso_frac, quality_idx, smooth_passes, show_labels, show_bonds, atom_scale, bond_width, relayout, cam_state):
         spacing = quality_values[quality_idx]
-        evaluator.regrid(spacing)
+        frame_idx = int(frame_idx or 0)
+
+        if not trajectory_mode:
+            assert evaluator is not None
+            evaluator.regrid(spacing)
 
         current_camera = extract_camera(relayout or {})
         current_eye = eye_norm(relayout or {})
@@ -747,7 +1085,19 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
         zoom_factor = base_eye / \
             current_eye if (current_eye and current_eye > 0) else 1.0
 
-        data = evaluator.orbital_data(idx)
+        if trajectory_mode:
+            grid, origin, steps, spacing_actual = _trajectory_grid(spacing)
+            frame = frames[frame_idx]
+            frame_mo = int(np.asarray(frame.mo_coeff).shape[1])
+            idx_eff = int(max(0, min(int(idx), frame_mo - 1)))
+            vals = _trajectory_values(frame_idx, idx_eff, spacing)
+            data = OrbitalData(grid=grid, values=vals, origin=origin, steps=steps, spacing=spacing_actual)
+            mol_local = frame_molecules[frame_idx]
+        else:
+            idx_eff = int(idx)
+            assert evaluator is not None
+            data = evaluator.orbital_data(idx_eff)
+            mol_local = mol
 
         nx, ny, nz = data.steps
         V = data.values.reshape(nx, ny, nz)
@@ -758,7 +1108,7 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
         if verbose:
             logger.info(
                 "UI update: idx=%d spacing=%.3f smooth=%d iso_frac=%.3f points=%d",
-                int(idx),
+                int(idx_eff),
                 float(spacing),
                 int(smooth_passes or 0),
                 float(iso_frac),
@@ -778,81 +1128,213 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
             cam_state.get('camera') if isinstance(cam_state, dict) else default_camera)
 
         fig = build_figure(
-            mol, data_disp, iso_val, show_labels=show_labels, show_bonds=show_bonds, debug=debug,
+            mol_local, data_disp, iso_val, show_labels=show_labels, show_bonds=show_bonds, debug=debug,
             atom_scale=atom_scale_eff, bond_width=bond_width_eff, bond_scale=bond_scale, camera=camera_to_apply,
             scene_ranges=scene_ranges, height=fig_height)
 
-        bond_count = len(mol.infer_bonds(
+        bond_count = len(mol_local.infer_bonds(
             scale=float(bond_scale))) if show_bonds else 0
-        info = f"Orbital {idx} | max |psi| = {np.max(np.abs(data.values)):.3f} | spacing={spacing:.2f} Å | smooth={int(smooth_passes or 0)} | points={data.grid.shape[0]} | bonds={bond_count} | zoom×={zoom_factor:.2f} | showing 0..{n_mo_display-1} of {n_mo}"
-        if mo_energies is not None:
-            info += f" | energy = {mo_energies[idx]:.6f} a.u."
-        if mo_occ is not None:
-            info += f" | occ = {mo_occ[idx]:.2f}"
-        if idx in active_set:
+        info = f"Orbital {idx_eff} | max |psi| = {np.max(np.abs(data.values)):.3f} | spacing={spacing:.2f} Å | smooth={int(smooth_passes or 0)} | points={data.grid.shape[0]} | bonds={bond_count} | zoom×={zoom_factor:.2f} | showing 0..{n_mo_display-1} of {n_mo}"
+        if trajectory_mode:
+            info = f"Frame {frame_idx} | " + info
+            frame = frames[frame_idx]
+            if frame.mo_energies is not None and idx_eff < len(frame.mo_energies):
+                info += f" | MO energy = {float(frame.mo_energies[idx_eff]):.6f} a.u."
+            if frame.mo_occ is not None and idx_eff < len(frame.mo_occ):
+                info += f" | occ = {float(frame.mo_occ[idx_eff]):.2f}"
+            for lbl, arr in traj_pes_series.items():
+                v = float(arr[int(frame_idx)])
+                if not np.isnan(v):
+                    info += f" | {lbl} = {v:.6f}"
+        else:
+            if mo_energies is not None:
+                info += f" | energy = {mo_energies[idx_eff]:.6f} a.u."
+            if mo_occ is not None:
+                info += f" | occ = {mo_occ[idx_eff]:.2f}"
+        if idx_eff in active_set:
             info += " | active"
         new_cam_state = {
             'base_eye_norm': base_eye,
             'last_eye_norm': current_eye or base_eye,
             'camera': camera_to_apply
         }
+        if show_pes:
+            return fig, _pes_figure(frame_idx), info, new_cam_state
         return fig, info, new_cam_state
 
     if use_minimal_ui:
-        @app.callback(
-            Output('orbital-plot', 'figure'),
-            Output('orbital-info', 'children'),
-            Output('camera-state', 'data'),
-            Input('orbital-idx', 'value'),
-            Input('iso-frac', 'value'),
-            Input('quality', 'value'),
-            Input('orbital-plot', 'relayoutData'),
-            Input('camera-state', 'data')
-        )
-        def update_orbital(idx, iso_frac, quality_idx, relayout, cam_state):  # type: ignore
-            return _update_common(
-                idx=idx,
-                iso_frac=iso_frac,
-                quality_idx=quality_idx,
-                smooth_passes=1,
-                show_labels=True,
-                show_bonds=True,
-                atom_scale=1.0,
-                bond_width=10,
-                relayout=relayout,
-                cam_state=cam_state,
+        if show_pes:
+            @app.callback(
+                Output('orbital-plot', 'figure'),
+                Output('pes-plot', 'figure'),
+                Output('orbital-info', 'children'),
+                Output('camera-state', 'data'),
+                Input('orbital-idx', 'value'),
+                Input('frame-idx', 'value'),
+                Input('iso-frac', 'value'),
+                Input('quality', 'value'),
+                Input('orbital-plot', 'relayoutData'),
+                Input('camera-state', 'data')
             )
+            def update_orbital(idx, frame_idx, iso_frac, quality_idx, relayout, cam_state):  # type: ignore
+                return _update_common(
+                    idx=idx,
+                    frame_idx=frame_idx,
+                    iso_frac=iso_frac,
+                    quality_idx=quality_idx,
+                    smooth_passes=1,
+                    show_labels=True,
+                    show_bonds=True,
+                    atom_scale=1.0,
+                    bond_width=10,
+                    relayout=relayout,
+                    cam_state=cam_state,
+                )
+        else:
+            @app.callback(
+                Output('orbital-plot', 'figure'),
+                Output('orbital-info', 'children'),
+                Output('camera-state', 'data'),
+                Input('orbital-idx', 'value'),
+                Input('iso-frac', 'value'),
+                Input('quality', 'value'),
+                Input('orbital-plot', 'relayoutData'),
+                Input('camera-state', 'data')
+            )
+            def update_orbital(idx, iso_frac, quality_idx, relayout, cam_state):  # type: ignore
+                return _update_common(
+                    idx=idx,
+                    frame_idx=0,
+                    iso_frac=iso_frac,
+                    quality_idx=quality_idx,
+                    smooth_passes=1,
+                    show_labels=True,
+                    show_bonds=True,
+                    atom_scale=1.0,
+                    bond_width=10,
+                    relayout=relayout,
+                    cam_state=cam_state,
+                )
     else:
-        @app.callback(
-            Output('orbital-plot', 'figure'),
-            Output('orbital-info', 'children'),
-            Output('camera-state', 'data'),
-            Input('orbital-idx', 'value'),
-            Input('iso-frac', 'value'),
-            Input('quality', 'value'),
-            Input('smooth', 'value'),
-            Input('label-toggle', 'value'),
-            Input('bond-toggle', 'value'),
-            Input('atom-scale', 'value'),
-            Input('bond-width', 'value'),
-            Input('orbital-plot', 'relayoutData'),
-            Input('camera-state', 'data')
-        )
-        def update_orbital(idx, iso_frac, quality_idx, smooth_passes, label_values, bond_values, atom_scale, bond_width, relayout, cam_state):  # type: ignore
-            show_labels = 'labels' in (label_values or [])
-            show_bonds = 'bonds' in (bond_values or [])
-            return _update_common(
-                idx=idx,
-                iso_frac=iso_frac,
-                quality_idx=quality_idx,
-                smooth_passes=smooth_passes,
-                show_labels=show_labels,
-                show_bonds=show_bonds,
-                atom_scale=atom_scale,
-                bond_width=bond_width,
-                relayout=relayout,
-                cam_state=cam_state,
+        if show_pes:
+            @app.callback(
+                Output('orbital-plot', 'figure'),
+                Output('pes-plot', 'figure'),
+                Output('orbital-info', 'children'),
+                Output('camera-state', 'data'),
+                Input('orbital-idx', 'value'),
+                Input('frame-idx', 'value'),
+                Input('iso-frac', 'value'),
+                Input('quality', 'value'),
+                Input('smooth', 'value'),
+                Input('label-toggle', 'value'),
+                Input('bond-toggle', 'value'),
+                Input('atom-scale', 'value'),
+                Input('bond-width', 'value'),
+                Input('orbital-plot', 'relayoutData'),
+                Input('camera-state', 'data')
             )
+            def update_orbital(idx, frame_idx, iso_frac, quality_idx, smooth_passes, label_values, bond_values, atom_scale, bond_width, relayout, cam_state):  # type: ignore
+                show_labels = 'labels' in (label_values or [])
+                show_bonds = 'bonds' in (bond_values or [])
+                return _update_common(
+                    idx=idx,
+                    frame_idx=frame_idx,
+                    iso_frac=iso_frac,
+                    quality_idx=quality_idx,
+                    smooth_passes=smooth_passes,
+                    show_labels=show_labels,
+                    show_bonds=show_bonds,
+                    atom_scale=atom_scale,
+                    bond_width=bond_width,
+                    relayout=relayout,
+                    cam_state=cam_state,
+                )
+        else:
+            @app.callback(
+                Output('orbital-plot', 'figure'),
+                Output('orbital-info', 'children'),
+                Output('camera-state', 'data'),
+                Input('orbital-idx', 'value'),
+                Input('iso-frac', 'value'),
+                Input('quality', 'value'),
+                Input('smooth', 'value'),
+                Input('label-toggle', 'value'),
+                Input('bond-toggle', 'value'),
+                Input('atom-scale', 'value'),
+                Input('bond-width', 'value'),
+                Input('orbital-plot', 'relayoutData'),
+                Input('camera-state', 'data')
+            )
+            def update_orbital(idx, iso_frac, quality_idx, smooth_passes, label_values, bond_values, atom_scale, bond_width, relayout, cam_state):  # type: ignore
+                show_labels = 'labels' in (label_values or [])
+                show_bonds = 'bonds' in (bond_values or [])
+                return _update_common(
+                    idx=idx,
+                    frame_idx=0,
+                    iso_frac=iso_frac,
+                    quality_idx=quality_idx,
+                    smooth_passes=smooth_passes,
+                    show_labels=show_labels,
+                    show_bonds=show_bonds,
+                    atom_scale=atom_scale,
+                    bond_width=bond_width,
+                    relayout=relayout,
+                    cam_state=cam_state,
+                )
+
+    if trajectory_mode:
+        @app.callback(
+            Output('orbital-idx', 'marks'),
+            Input('frame-idx', 'value'),
+        )
+        def update_orbital_marks(frame_idx):  # type: ignore
+            i = int(max(0, min(int(frame_idx or 0), len(frames) - 1)))
+            frame = frames[i]
+            occ = np.asarray(frame.mo_occ).reshape(-1)
+            en = np.asarray(frame.mo_energies).reshape(-1)
+            homo_mark, lumo_mark, _ = _compute_homo_lumo(occ, en, n_mo_display)
+            return _orbital_marks(n_mo_display, homo_mark, lumo_mark)
+
+        @app.callback(
+            Output('frame-play-state', 'data'),
+            Output('play-frames', 'children'),
+            Output('frame-interval', 'disabled'),
+            Output('frame-interval', 'interval'),
+            Input('play-frames', 'n_clicks'),
+            Input('frame-speed', 'value'),
+            State('frame-play-state', 'data'),
+            State('frame-interval', 'interval'),
+            prevent_initial_call=True,
+        )
+        def toggle_play(_n_clicks, speed_ms, playing, current_interval):  # type: ignore
+            try:
+                interval_ms = int(float(speed_ms)) if speed_ms is not None else int(current_interval or 600)
+            except (TypeError, ValueError):
+                interval_ms = int(current_interval or 600)
+            # Guard rails for manual input.
+            interval_ms = max(50, min(60000, interval_ms))
+            triggered = getattr(dash, 'ctx', None)
+            triggered_id = getattr(triggered, 'triggered_id', None) if triggered is not None else None
+            if triggered_id == 'play-frames':
+                is_playing = not bool(playing)
+            else:
+                is_playing = bool(playing)
+            return is_playing, ('Pause' if is_playing else 'Play'), (not is_playing), interval_ms
+
+        @app.callback(
+            Output('frame-idx', 'value'),
+            Input('frame-interval', 'n_intervals'),
+            State('frame-idx', 'value'),
+            State('frame-play-state', 'data'),
+            prevent_initial_call=True,
+        )
+        def advance_frame(_n_intervals, frame_idx, playing):  # type: ignore
+            if not bool(playing):
+                return no_update
+            max_frame = len(frames) - 1
+            i = int(frame_idx or 0)
+            return 0 if i >= max_frame else i + 1
 
     # Always print a user-friendly URL
     display_host = '127.0.0.1' if str(host) in (

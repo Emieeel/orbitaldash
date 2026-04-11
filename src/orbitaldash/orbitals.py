@@ -13,12 +13,16 @@ Units:
 
 import numpy as np
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, Any, Callable
+from typing import Optional, Tuple, Dict, Any, Callable, Union
 import threading
 import logging
 import time
+import json
+from pathlib import Path
+import hashlib
 
 from .geometry import Molecule, standardize_geometry
+from .trajectory import TrajectoryData
 
 # Unit conversion constants
 BOHR_TO_ANG = 0.529177210903
@@ -75,6 +79,140 @@ def make_grid(mol: Molecule, padding: float = 3.0, spacing: float = 0.3) -> Tupl
     X, Y, Z = np.meshgrid(xs, ys, zs, indexing='ij')
     grid = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1)
     return grid, mins, steps, spacing
+
+
+def make_grid_from_bounds(mins: np.ndarray, maxs: np.ndarray, spacing: float) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int, int], float]:
+    """Create a Cartesian grid from precomputed bounds."""
+    mins = np.asarray(mins, dtype=float)
+    maxs = np.asarray(maxs, dtype=float)
+    lengths = maxs - mins
+    steps = tuple(int(np.ceil(l / spacing)) + 1 for l in lengths)
+    steps = (int(steps[0]), int(steps[1]), int(steps[2]))
+    xs = np.linspace(mins[0], maxs[0], steps[0])
+    ys = np.linspace(mins[1], maxs[1], steps[1])
+    zs = np.linspace(mins[2], maxs[2], steps[2])
+    X, Y, Z = np.meshgrid(xs, ys, zs, indexing='ij')
+    grid = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1)
+    return grid, mins, steps, spacing
+
+
+def make_global_grid(molecules: list[Molecule], padding: float = 3.0, spacing: float = 0.3) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int, int], float]:
+    """Create one shared grid for all molecules in a trajectory."""
+    if not molecules:
+        raise ValueError("molecules must not be empty")
+    mins = np.min(np.stack([m.coords.min(axis=0) for m in molecules], axis=0), axis=0) - float(padding)
+    maxs = np.max(np.stack([m.coords.max(axis=0) for m in molecules], axis=0), axis=0) + float(padding)
+    return make_grid_from_bounds(mins, maxs, spacing)
+
+
+def trajectory_cache_key(trajectory: TrajectoryData, spacing: float, padding: float = 3.0) -> str:
+    """Build a stable cache key for trajectory + grid settings."""
+    h = hashlib.sha256()
+    h.update(f"spacing={float(spacing):.6f};padding={float(padding):.6f};frames={len(trajectory.frames)}".encode("utf-8"))
+    for frame in trajectory.frames:
+        mol = standardize_geometry(frame.geometry)
+        h.update(";".join(mol.symbols).encode("utf-8"))
+        h.update(np.asarray(mol.coords, dtype=np.float64).tobytes())
+        h.update(np.asarray(frame.mo_coeff, dtype=np.float64).tobytes())
+    return h.hexdigest()[:16]
+
+
+def precompute_trajectory_to_hdf5(
+    trajectory: TrajectoryData,
+    h5_path: Union[str, Path],
+    spacing: float,
+    padding: float = 3.0,
+    verbose: bool = False,
+) -> str:
+    """Precompute trajectory orbital volumes on a shared grid and store in HDF5."""
+    try:
+        import h5py  # type: ignore
+    except ImportError as e:  # pragma: no cover
+        raise RuntimeError("h5py is required for precomputed trajectory mode") from e
+
+    h5_path = str(h5_path)
+    molecules = [standardize_geometry(f.geometry) for f in trajectory.frames]
+    grid, origin, steps, _ = make_global_grid(molecules, padding=float(padding), spacing=float(spacing))
+    grid32 = grid.astype(np.float32, copy=False)
+
+    p = Path(h5_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with h5py.File(h5_path, "w") as h5:
+        g_grid = h5.create_group("grid")
+        g_grid.create_dataset("points", data=grid32, dtype="f4")
+        g_grid.create_dataset("origin", data=np.asarray(origin, dtype=np.float32), dtype="f4")
+        g_grid.create_dataset("steps", data=np.asarray(steps, dtype=np.int32), dtype="i4")
+        g_grid.attrs["spacing"] = float(spacing)
+        g_grid.attrs["padding"] = float(padding)
+
+        g_frames = h5.create_group("frames")
+        for i, frame in enumerate(trajectory.frames):
+            mol = molecules[i]
+            grp = g_frames.create_group(f"{i:04d}")
+            mo_coeff = np.asarray(frame.mo_coeff)
+            n_mo = int(mo_coeff.shape[1])
+            dset = grp.create_dataset(
+                "values",
+                shape=(n_mo, grid32.shape[0]),
+                dtype="f4",
+                chunks=(1, min(grid32.shape[0], 262144)),
+                compression="lzf",
+                shuffle=True,
+            )
+            if frame.custom_eval is not None:
+                vals = np.asarray(frame.custom_eval(grid), dtype=np.float32)
+                if vals.shape != (grid32.shape[0], n_mo):
+                    raise ValueError(
+                        f"custom_eval for frame {i} returned {vals.shape}, expected {(grid32.shape[0], n_mo)}"
+                    )
+                dset[:, :] = vals.T
+            else:
+                for mo_idx in range(n_mo):
+                    vec = mo_coeff[:, mo_idx]
+                    vals = evaluate_mo_on_grid_single(mol, frame.basis, vec, grid)
+                    dset[mo_idx, :] = np.asarray(vals, dtype=np.float32)
+
+            if frame.mo_energies is not None:
+                grp.create_dataset("mo_energies", data=np.asarray(frame.mo_energies, dtype=np.float32), dtype="f4")
+            if frame.mo_occ is not None:
+                grp.create_dataset("mo_occ", data=np.asarray(frame.mo_occ, dtype=np.float32), dtype="f4")
+            grp.attrs["symbols"] = json.dumps(mol.symbols)
+            grp.create_dataset("coords", data=np.asarray(mol.coords, dtype=np.float32), dtype="f4")
+            grp.attrs["metadata"] = json.dumps(frame.metadata)
+
+            if verbose:
+                logger.info("Precomputed frame %d/%d", i + 1, len(trajectory.frames))
+
+        h5.attrs["n_frames"] = int(len(trajectory.frames))
+        h5.attrs["cache_key"] = trajectory_cache_key(trajectory, spacing=float(spacing), padding=float(padding))
+    return h5_path
+
+
+def load_trajectory_hdf5_grid(h5_path: Union[str, Path]) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int, int], float]:
+    """Load shared trajectory grid from a precomputed HDF5 file."""
+    try:
+        import h5py  # type: ignore
+    except ImportError as e:  # pragma: no cover
+        raise RuntimeError("h5py is required for precomputed trajectory mode") from e
+
+    with h5py.File(str(h5_path), "r") as h5:
+        grid = np.asarray(h5["grid/points"][:], dtype=float)
+        origin = np.asarray(h5["grid/origin"][:], dtype=float)
+        steps_arr = np.asarray(h5["grid/steps"][:], dtype=int)
+        steps = (int(steps_arr[0]), int(steps_arr[1]), int(steps_arr[2]))
+        spacing = float(h5["grid"].attrs["spacing"])
+    return grid, origin, steps, spacing
+
+
+def load_trajectory_hdf5_values(h5_path: Union[str, Path], frame_idx: int, orbital_idx: int) -> np.ndarray:
+    """Load one frame/orbital vector from precomputed HDF5."""
+    try:
+        import h5py  # type: ignore
+    except ImportError as e:  # pragma: no cover
+        raise RuntimeError("h5py is required for precomputed trajectory mode") from e
+
+    with h5py.File(str(h5_path), "r") as h5:
+        return np.asarray(h5[f"frames/{int(frame_idx):04d}/values"][int(orbital_idx), :], dtype=float)
 
 
 def build_pyscf_mol(mol: Molecule, basis_or_mol: Any) -> Any:

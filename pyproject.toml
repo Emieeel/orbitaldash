@@ -10,10 +10,9 @@ authors = [{ name = "Your Name", email = "you@example.com" }]
 license = { text = "MIT" }
 readme = "README.md"
 requires-python = ">=3.9"
-dependencies = ["numpy", "scipy", "dash", "plotly", "pyscf; extra == 'pyscf'"]
+dependencies = ["numpy", "scipy", "dash", "plotly", "h5py", "pyscf"]
 
 [project.optional-dependencies]
-full = ["pyscf"]
 dev = ["pytest"]
 
 [project.urls]
