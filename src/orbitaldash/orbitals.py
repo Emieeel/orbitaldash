@@ -105,15 +105,27 @@ def make_global_grid(molecules: list[Molecule], padding: float = 3.0, spacing: f
     return make_grid_from_bounds(mins, maxs, spacing)
 
 
+# Coordinates and MO coefficients are hashed after rounding to this many decimals. Re-running the
+# same calculation differs at the ~1e-11 level (e.g. threaded BLAS), which must not change the key;
+# differences below 1e-5 are invisible once grid values are stored as float32.
+_CACHE_KEY_DECIMALS = 5
+
+
+def _quantized_bytes(x: Any) -> bytes:
+    """Shape plus integer-quantized values; integers also avoid the -0.0 vs 0.0 byte mismatch."""
+    q = np.rint(np.asarray(x, dtype=np.float64) * 10.0**_CACHE_KEY_DECIMALS).astype(np.int64)
+    return f"{q.shape};".encode("utf-8") + q.tobytes()
+
+
 def trajectory_cache_key(trajectory: TrajectoryData, spacing: float, padding: float = 3.0) -> str:
-    """Build a stable cache key for trajectory + grid settings."""
+    """Build a cache key for trajectory + grid settings that is stable under numerical noise."""
     h = hashlib.sha256()
     h.update(f"spacing={float(spacing):.6f};padding={float(padding):.6f};frames={len(trajectory.frames)}".encode("utf-8"))
     for frame in trajectory.frames:
         mol = standardize_geometry(frame.geometry)
         h.update(";".join(mol.symbols).encode("utf-8"))
-        h.update(np.asarray(mol.coords, dtype=np.float64).tobytes())
-        h.update(np.asarray(frame.mo_coeff, dtype=np.float64).tobytes())
+        h.update(_quantized_bytes(mol.coords))
+        h.update(_quantized_bytes(frame.mo_coeff))
     return h.hexdigest()[:16]
 
 

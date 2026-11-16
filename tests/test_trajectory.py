@@ -106,6 +106,34 @@ def test_make_global_grid_and_cache_key_behavior():
     assert key1 != key3
 
 
+def _traj_with(mo_coeff: np.ndarray, coords_shift: float = 0.0) -> TrajectoryData:
+    frame = _frame(0.0)
+    frame["mo_coeff"] = mo_coeff
+    frame["geometry"]["coords"] = frame["geometry"]["coords"] + coords_shift
+    return standardize_trajectory([frame])
+
+
+def test_cache_key_stable_under_rerun_noise():
+    rng = np.random.default_rng(0)
+    c = np.array([[0.7, 0.0], [0.3, -0.9]])
+    base = trajectory_cache_key(_traj_with(c), spacing=0.3)
+
+    # Noise like a re-run of the same SCF/CASCI (~1e-11), and -0.0 from a symmetry zero.
+    noisy = c + rng.uniform(-1e-11, 1e-11, size=c.shape)
+    noisy[0, 1] = -0.0
+    assert trajectory_cache_key(_traj_with(noisy, coords_shift=1e-11), spacing=0.3) == base
+
+    # Changes that alter the picture must change the key.
+    changed = c.copy()
+    changed[1, 0] += 1e-3
+    assert trajectory_cache_key(_traj_with(changed), spacing=0.3) != base
+    flipped = c.copy()
+    flipped[:, 1] *= -1.0
+    assert trajectory_cache_key(_traj_with(flipped), spacing=0.3) != base
+    assert trajectory_cache_key(_traj_with(c, coords_shift=1e-3), spacing=0.3) != base
+    assert trajectory_cache_key(_traj_with(c.reshape(1, 4)), spacing=0.3) != base
+
+
 def test_make_global_grid_empty_raises():
     with pytest.raises(ValueError, match="must not be empty"):
         make_global_grid([])
