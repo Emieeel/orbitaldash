@@ -541,6 +541,42 @@ def test_trajectory_partial_cache_file_is_rebuilt(tmp_path):
     assert list(tmp_path.glob("*.partial")) == []
 
 
+def test_rebuild_cache_rebuilds_once_per_launch(tmp_path, monkeypatch):
+    import orbitaldash.app as app_module
+
+    calls = []
+    real_precompute = app_module.precompute_trajectory_to_hdf5
+
+    def counting_precompute(*args, **kwargs):
+        calls.append(kwargs.get("spacing"))
+        return real_precompute(*args, **kwargs)
+
+    monkeypatch.setattr(app_module, "precompute_trajectory_to_hdf5", counting_precompute)
+    app = launch_app(trajectory=_make_h2_trajectory(3), mode="precomputed", cache_dir=str(tmp_path),
+                     rebuild_cache=True, auto_run=False, minimal_ui=True)
+    assert len(calls) == 1
+
+    server = make_server("127.0.0.1", 0, app.server)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        output_key = _callback_output_key(app, ["orbital-plot", "pes-plot", "camera-state"])
+        for frame_idx in (1, 2):
+            payload = _build_update_payload_from_callback(
+                app, output_key, overrides_by_id_prop={("frame-idx", "value"): frame_idx}
+            )
+            url = f"http://127.0.0.1:{int(server.server_port)}/_dash-update-component"
+            status, _headers, _body = _http_post_json(url, payload)
+            assert status == 200
+    finally:
+        server.shutdown()
+        thread.join(timeout=5.0)
+        server.server_close()
+
+    # Moving the frame slider must reuse the cache built at startup, not precompute again.
+    assert len(calls) == 1
+
+
 def test_trajectory_homo_lumo_marks_change_with_frame(tmp_path):
     def make_eval():
         def custom_eval(grid: np.ndarray) -> np.ndarray:

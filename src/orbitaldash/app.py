@@ -586,12 +586,13 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
             key = trajectory_cache_key(traj, spacing=float(spacing), padding=3.0)
         return str(base_dir / f"trajectory_{key}_s{sp_tag}.h5")
 
+    # These caches are per launch, so rebuild_cache only needs to force the first build per spacing.
     _traj_grid_cache: dict[float, tuple[np.ndarray, np.ndarray, tuple[int, int, int], float]] = {}
     _traj_vals_cache: dict[tuple[float, int, int], np.ndarray] = {}
     _traj_h5_by_spacing: dict[float, str] = {}
 
     def _ensure_h5(spacing: float) -> str:
-        if float(spacing) in _traj_h5_by_spacing and not rebuild_cache:
+        if float(spacing) in _traj_h5_by_spacing:
             return _traj_h5_by_spacing[float(spacing)]
         assert traj is not None
         path = _build_precomputed_path(spacing)
@@ -610,7 +611,7 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
 
     def _trajectory_grid(spacing: float):
         sp = float(spacing)
-        if sp in _traj_grid_cache and not rebuild_cache:
+        if sp in _traj_grid_cache:
             return _traj_grid_cache[sp]
         if mode in {'auto', 'precomputed'}:
             h5_path = _ensure_h5(sp)
@@ -624,7 +625,7 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
     def _trajectory_values(frame_idx: int, orbital_idx: int, spacing: float) -> np.ndarray:
         sp = float(spacing)
         key = (sp, int(frame_idx), int(orbital_idx))
-        if key in _traj_vals_cache and not rebuild_cache:
+        if key in _traj_vals_cache:
             return _traj_vals_cache[key]
 
         if mode in {'auto', 'precomputed'}:
