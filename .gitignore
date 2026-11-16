@@ -51,3 +51,6 @@ pyscf_*.out
 
 # Node (if any)
 node_modules/
+
+# orbitaldash trajectory caches (regenerated on demand)
+.orbitaldash_cache/
