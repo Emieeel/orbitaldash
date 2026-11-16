@@ -18,6 +18,8 @@ import threading
 import logging
 import time
 import json
+import os
+import contextlib
 from pathlib import Path
 import hashlib
 
@@ -129,6 +131,21 @@ def trajectory_cache_key(trajectory: TrajectoryData, spacing: float, padding: fl
     return h.hexdigest()[:16]
 
 
+@contextlib.contextmanager
+def _atomic_output_path(path: Path):
+    """Yield a temporary sibling path that is renamed to ``path`` only if the block succeeds.
+
+    An interrupted precompute then never leaves a partial file at ``path`` that later runs would
+    load as a valid cache.
+    """
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.partial")
+    try:
+        yield tmp
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def precompute_trajectory_to_hdf5(
     trajectory: TrajectoryData,
     h5_path: Union[str, Path],
@@ -149,7 +166,7 @@ def precompute_trajectory_to_hdf5(
 
     p = Path(h5_path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    with h5py.File(h5_path, "w") as h5:
+    with _atomic_output_path(p) as tmp_path, h5py.File(tmp_path, "w") as h5:
         g_grid = h5.create_group("grid")
         g_grid.create_dataset("points", data=grid32, dtype="f4")
         g_grid.create_dataset("origin", data=np.asarray(origin, dtype=np.float32), dtype="f4")
@@ -198,6 +215,21 @@ def precompute_trajectory_to_hdf5(
         h5.attrs["n_frames"] = int(len(trajectory.frames))
         h5.attrs["cache_key"] = trajectory_cache_key(trajectory, spacing=float(spacing), padding=float(padding))
     return h5_path
+
+
+def trajectory_hdf5_is_complete(h5_path: Union[str, Path], n_frames: int) -> bool:
+    """Whether ``h5_path`` is a readable, fully written cache with ``n_frames`` frames."""
+    if not Path(h5_path).exists():
+        return False
+    try:
+        import h5py  # type: ignore
+
+        with h5py.File(str(h5_path), "r") as h5:
+            # n_frames is written last, so files cut off by older versions lack it.
+            finished = int(h5.attrs.get("n_frames", -1)) == int(n_frames)
+            return finished and len(h5["frames"]) == int(n_frames)
+    except Exception:  # truncated or not an HDF5 file
+        return False
 
 
 def load_trajectory_hdf5_grid(h5_path: Union[str, Path]) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int, int], float]:

@@ -8,6 +8,7 @@ from orbitaldash.orbitals import (
     make_global_grid,
     precompute_trajectory_to_hdf5,
     trajectory_cache_key,
+    trajectory_hdf5_is_complete,
 )
 from orbitaldash.trajectory import (
     TrajectoryData,
@@ -172,3 +173,18 @@ def test_precompute_raises_on_bad_custom_eval_shape(tmp_path):
 
     with pytest.raises(ValueError, match="custom_eval"):
         precompute_trajectory_to_hdf5(traj, h5_path=tmp_path / "bad.h5", spacing=0.3)
+    # A failed precompute must not leave a cache file (or its temporary file) behind.
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_trajectory_hdf5_is_complete(tmp_path):
+    traj = standardize_trajectory([_frame(0.0), _frame(0.2)])
+    good = tmp_path / "good.h5"
+    precompute_trajectory_to_hdf5(traj, h5_path=good, spacing=0.35)
+    assert trajectory_hdf5_is_complete(good, n_frames=2)
+    assert not trajectory_hdf5_is_complete(good, n_frames=3)
+    assert not trajectory_hdf5_is_complete(tmp_path / "missing.h5", n_frames=2)
+
+    truncated = tmp_path / "truncated.h5"
+    truncated.write_bytes(good.read_bytes()[:2048])
+    assert not trajectory_hdf5_is_complete(truncated, n_frames=2)

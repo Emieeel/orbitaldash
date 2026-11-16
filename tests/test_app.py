@@ -523,6 +523,24 @@ def test_trajectory_auto_mode_builds_hdf5_cache(tmp_path):
     assert files, "Expected at least one trajectory cache file to be created"
 
 
+def test_trajectory_partial_cache_file_is_rebuilt(tmp_path):
+    trajectory = _make_h2_trajectory(3)
+    kwargs = dict(trajectory=trajectory, mode="precomputed", cache_dir=str(tmp_path),
+                  auto_run=False, minimal_ui=True)
+    launch_app(**kwargs)
+    (cache_file,) = list(tmp_path.glob("*.h5"))
+
+    # Simulate a precompute that was interrupted by an older version: file exists but is cut off.
+    cache_file.write_bytes(cache_file.read_bytes()[:2048])
+    launch_app(**kwargs)
+
+    import h5py
+
+    with h5py.File(cache_file, "r") as h5:
+        assert int(h5.attrs["n_frames"]) == 3
+    assert list(tmp_path.glob("*.partial")) == []
+
+
 def test_trajectory_homo_lumo_marks_change_with_frame(tmp_path):
     def make_eval():
         def custom_eval(grid: np.ndarray) -> np.ndarray:

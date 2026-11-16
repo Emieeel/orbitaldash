@@ -25,6 +25,7 @@ from .orbitals import (
     load_trajectory_hdf5_grid,
     load_trajectory_hdf5_values,
     trajectory_cache_key,
+    trajectory_hdf5_is_complete,
 )
 from .trajectory import standardize_trajectory, frame_reaction_coordinates
 
@@ -594,7 +595,8 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
             return _traj_h5_by_spacing[float(spacing)]
         assert traj is not None
         path = _build_precomputed_path(spacing)
-        needs_build = rebuild_cache or (not Path(path).exists())
+        complete = trajectory_hdf5_is_complete(path, n_frames=len(traj.frames))
+        needs_build = rebuild_cache or not complete
         if needs_build:
             precompute_trajectory_to_hdf5(
                 traj,
