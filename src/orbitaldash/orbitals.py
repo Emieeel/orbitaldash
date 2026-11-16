@@ -115,12 +115,38 @@ _CACHE_KEY_DECIMALS = 5
 
 def _quantized_bytes(x: Any) -> bytes:
     """Shape plus integer-quantized values; integers also avoid the -0.0 vs 0.0 byte mismatch."""
-    q = np.rint(np.asarray(x, dtype=np.float64) * 10.0**_CACHE_KEY_DECIMALS).astype(np.int64)
+    x = np.clip(np.nan_to_num(np.asarray(x, dtype=np.float64)), -1e12, 1e12)  # no int64 overflow
+    q = np.rint(x * 10.0**_CACHE_KEY_DECIMALS).astype(np.int64)
     return f"{q.shape};".encode("utf-8") + q.tobytes()
 
 
+# Fixed offsets (Angstrom) around each atom where the orbitals are sampled for the cache key.
+_KEY_PROBE_OFFSETS = np.array(
+    [[0.31, 0.17, 0.11], [-0.23, 0.41, -0.29], [0.13, -0.37, 0.53], [-0.47, -0.07, -0.19]]
+)
+
+
+def _orbital_samples(frame: Any, mol: Molecule) -> np.ndarray:
+    """Orbital values at a few points around each atom.
+
+    These capture what coordinates and coefficients alone miss: the basis set (or PySCF Mole) and
+    the behaviour of a ``custom_eval``, including its closure variables.
+    """
+    points = (mol.coords[:, None, :] + _KEY_PROBE_OFFSETS[None, :, :]).reshape(-1, 3)
+    if frame.custom_eval is not None:
+        return np.asarray(frame.custom_eval(points), dtype=float)
+    if frame.basis is None:
+        return np.zeros(0)
+    return evaluate_mos_on_grid(mol, frame.basis, np.asarray(frame.mo_coeff, dtype=float), points)
+
+
 def trajectory_cache_key(trajectory: TrajectoryData, spacing: float, padding: float = 3.0) -> str:
-    """Build a cache key for trajectory + grid settings that is stable under numerical noise."""
+    """Build a cache key for trajectory + grid settings that is stable under numerical noise.
+
+    The key covers geometry, MO coefficients, and orbital values sampled near the atoms, so a
+    different basis or ``custom_eval`` gives a different key. Pass ``rebuild_cache=True`` (or an
+    explicit ``cache_key``) to ``launch_app`` if a change only affects orbitals far from the atoms.
+    """
     h = hashlib.sha256()
     h.update(f"spacing={float(spacing):.6f};padding={float(padding):.6f};frames={len(trajectory.frames)}".encode("utf-8"))
     for frame in trajectory.frames:
@@ -128,6 +154,7 @@ def trajectory_cache_key(trajectory: TrajectoryData, spacing: float, padding: fl
         h.update(";".join(mol.symbols).encode("utf-8"))
         h.update(_quantized_bytes(mol.coords))
         h.update(_quantized_bytes(frame.mo_coeff))
+        h.update(_quantized_bytes(_orbital_samples(frame, mol)))
     return h.hexdigest()[:16]
 
 

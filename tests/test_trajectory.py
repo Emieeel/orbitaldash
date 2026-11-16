@@ -135,6 +135,35 @@ def test_cache_key_stable_under_rerun_noise():
     assert trajectory_cache_key(_traj_with(c.reshape(1, 4)), spacing=0.3) != base
 
 
+def test_cache_key_depends_on_custom_eval_behaviour():
+    def make_traj(width: float) -> TrajectoryData:
+        def custom_eval(grid: np.ndarray) -> np.ndarray:
+            r2 = np.sum(grid**2, axis=1)
+            return np.stack([np.exp(-r2 / width), np.exp(-2.0 * r2 / width)], axis=1)
+
+        frame = _frame(0.0)
+        frame["custom_eval"] = custom_eval
+        return standardize_trajectory([frame])
+
+    # Same geometry and placeholder mo_coeff; only the closure variable differs.
+    k05, k05_again, k06 = (trajectory_cache_key(make_traj(w), spacing=0.3) for w in (0.5, 0.5, 0.6))
+    assert k05 == k05_again
+    assert k05 != k06
+
+
+def test_cache_key_depends_on_basis():
+    pytest.importorskip("pyscf")
+
+    def make_traj(basis: str) -> TrajectoryData:
+        frame = _frame(0.0, basis=basis)
+        frame["custom_eval"] = None
+        return standardize_trajectory([frame])
+
+    # H2 has two AOs in both bases, so the coefficient matrix alone cannot tell them apart.
+    k3, k6 = (trajectory_cache_key(make_traj(b), spacing=0.3) for b in ("sto-3g", "sto-6g"))
+    assert k3 != k6
+
+
 def test_make_global_grid_empty_raises():
     with pytest.raises(ValueError, match="must not be empty"):
         make_global_grid([])
