@@ -24,6 +24,7 @@ from .orbitals import (
     precompute_trajectory_to_hdf5,
     load_trajectory_hdf5_grid,
     load_trajectory_hdf5_values,
+    prune_trajectory_cache,
     trajectory_cache_key,
     trajectory_hdf5_is_complete,
 )
@@ -382,7 +383,8 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
                jupyter: Optional[bool] = None,
                jupyter_mode: str = 'inline',
                minimal_ui: Optional[bool] = None,
-               bond_scale: float = 1.2):
+               bond_scale: float = 1.2,
+               cache_max_files: Optional[int] = 10):
     """Launch a Dash app to explore molecular orbitals interactively.
 
     The app renders a molecule with atom/bond controls and an orbital isosurface
@@ -406,6 +408,9 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
             must include:
             ``metadata['pes'] = {'LabelA': energy_a, 'LabelB': energy_b, ...}``
             Any provided labels are plotted.
+        cache_max_files: In trajectory mode, keep at most this many automatically named cache files
+            in the cache directory, deleting the least recently used ones after a new file is built.
+            Files named with an explicit ``cache_key`` are never deleted. ``None`` disables cleanup.
         host: Host interface for the Dash server.
         port: Port for the Dash server.
         auto_run: Whether to immediately start the server.
@@ -592,8 +597,9 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
     _traj_h5_by_spacing: dict[float, str] = {}
 
     def _ensure_h5(spacing: float) -> str:
-        if float(spacing) in _traj_h5_by_spacing:
-            return _traj_h5_by_spacing[float(spacing)]
+        known = _traj_h5_by_spacing.get(float(spacing))
+        if known is not None and Path(known).exists():  # may be pruned by another session
+            return known
         assert traj is not None
         path = _build_precomputed_path(spacing)
         complete = trajectory_hdf5_is_complete(path, n_frames=len(traj.frames))
@@ -606,7 +612,17 @@ def launch_app(geometry=None, basis: Optional[Any] = None, mo_coeff: Optional[np
                 padding=3.0,
                 verbose=bool(verbose),
             )
+        else:
+            try:
+                Path(path).touch()  # mark as recently used for prune_trajectory_cache
+            except OSError:  # read-only cache file
+                pass
         _traj_h5_by_spacing[float(spacing)] = path
+        if needs_build and cache_max_files is not None:
+            removed = prune_trajectory_cache(Path(path).parent, max_files=int(cache_max_files),
+                                             keep=tuple(_traj_h5_by_spacing.values()))
+            if removed:
+                logger.info("Removed %d old trajectory cache file(s)", len(removed))
         return path
 
     def _trajectory_grid(spacing: float):

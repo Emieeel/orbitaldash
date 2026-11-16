@@ -577,6 +577,21 @@ def test_rebuild_cache_rebuilds_once_per_launch(tmp_path, monkeypatch):
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize("max_files, expected_files", [(1, 1), (None, 2)])
+def test_trajectory_cache_is_pruned_after_build(tmp_path, max_files, expected_files):
+    for n_frames in (3, 4):  # two different trajectories, so two cache files
+        launch_app(trajectory=_make_h2_trajectory(n_frames), mode="precomputed",
+                   cache_dir=str(tmp_path), cache_max_files=max_files, auto_run=False,
+                   minimal_ui=True)
+    files = list(tmp_path.glob("*.h5"))
+    assert len(files) == expected_files
+    if max_files == 1:
+        import h5py
+
+        with h5py.File(files[0], "r") as h5:  # the newest trajectory survives
+            assert int(h5.attrs["n_frames"]) == 4
+
+
 def test_trajectory_homo_lumo_marks_change_with_frame(tmp_path):
     def make_eval():
         def custom_eval(grid: np.ndarray) -> np.ndarray:

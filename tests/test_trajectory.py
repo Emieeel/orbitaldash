@@ -1,3 +1,6 @@
+import os
+import time
+
 import numpy as np
 import pytest
 
@@ -7,6 +10,7 @@ from orbitaldash.orbitals import (
     load_trajectory_hdf5_values,
     make_global_grid,
     precompute_trajectory_to_hdf5,
+    prune_trajectory_cache,
     trajectory_cache_key,
     trajectory_hdf5_is_complete,
 )
@@ -217,3 +221,26 @@ def test_trajectory_hdf5_is_complete(tmp_path):
     truncated = tmp_path / "truncated.h5"
     truncated.write_bytes(good.read_bytes()[:2048])
     assert not trajectory_hdf5_is_complete(truncated, n_frames=2)
+
+
+def test_prune_trajectory_cache_removes_least_recently_used(tmp_path):
+    now = time.time()
+
+    def make(name: str, age_s: float):
+        p = tmp_path / name
+        p.write_bytes(b"x")
+        os.utime(p, (now - age_s, now - age_s))
+        return p
+
+    auto = [make(f"trajectory_{i:016x}_s0p200.h5", age_s=100.0 * (5 - i)) for i in range(5)]
+    user_file = make("mine.h5", age_s=1e6)
+    explicit_key = make("trajectory_mykey_s0p200.h5", age_s=1e6)
+    old_partial = make(".trajectory_0000000000000000_s0p200.h5.123.partial", age_s=2 * 86400)
+    new_partial = make(".trajectory_0000000000000001_s0p200.h5.456.partial", age_s=10.0)
+
+    removed = prune_trajectory_cache(tmp_path, max_files=2, keep=(auto[0],))
+
+    # auto[0] is the oldest but protected; auto[4] is the newest. Everything else auto-named goes.
+    assert sorted(removed) == sorted([auto[1], auto[2], auto[3], old_partial])
+    survivors = [auto[0], auto[4], user_file, explicit_key, new_partial]
+    assert sorted(tmp_path.iterdir()) == sorted(survivors)

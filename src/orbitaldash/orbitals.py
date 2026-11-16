@@ -19,6 +19,7 @@ import logging
 import time
 import json
 import os
+import re
 import contextlib
 from pathlib import Path
 import hashlib
@@ -257,6 +258,46 @@ def trajectory_hdf5_is_complete(h5_path: Union[str, Path], n_frames: int) -> boo
             return finished and len(h5["frames"]) == int(n_frames)
     except Exception:  # truncated or not an HDF5 file
         return False
+
+
+# Names produced from trajectory_cache_key; files with an explicit cache_key never match.
+_AUTO_CACHE_NAME = re.compile(r"^trajectory_[0-9a-f]{16}_s\d+p\d{3}\.h5$")
+_PARTIAL_NAME = re.compile(r"^\.trajectory_.*\.h5\.\d+\.partial$")
+_STALE_PARTIAL_SECONDS = 24 * 3600
+
+
+def prune_trajectory_cache(
+    cache_dir: Union[str, Path], max_files: int, keep: tuple = ()
+) -> list[Path]:
+    """Delete the least recently used automatic cache files in ``cache_dir`` beyond ``max_files``.
+
+    Only files named from :func:`trajectory_cache_key` are considered, so user files and files
+    named with an explicit ``cache_key`` are never removed. Paths in ``keep`` are always retained.
+    Temporary files left by a killed precompute are removed once they are a day old.
+
+    Returns:
+        list[Path]: The deleted files.
+    """
+    keep_set = {Path(p).resolve() for p in keep}
+    auto, removed = [], []
+    now = time.time()
+    for p in Path(cache_dir).iterdir():
+        try:
+            mtime = p.stat().st_mtime
+            if _PARTIAL_NAME.match(p.name) and now - mtime > _STALE_PARTIAL_SECONDS:
+                p.unlink()
+                removed.append(p)
+            elif _AUTO_CACHE_NAME.match(p.name):
+                auto.append((p.resolve() in keep_set, mtime, p))
+        except FileNotFoundError:  # removed concurrently
+            continue
+    # Oldest unprotected files first.
+    deletable = sorted((mtime, p) for kept, mtime, p in auto if not kept)
+    n_excess = len(auto) - int(max_files)
+    for _mtime, p in deletable[:max(0, n_excess)]:
+        p.unlink(missing_ok=True)
+        removed.append(p)
+    return removed
 
 
 def load_trajectory_hdf5_grid(h5_path: Union[str, Path]) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int, int], float]:
